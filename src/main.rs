@@ -8,6 +8,7 @@ mod download;
 mod mirror;
 mod progress_bar;
 mod rustup;
+mod search;
 mod serve;
 mod verify;
 
@@ -55,6 +56,14 @@ enum Panamax {
         /// Base URL used for rewriting. Overrides value in mirror.toml.
         #[arg(short, long)]
         base_url: Option<String>,
+    },
+
+    /// Create the local database used by cargo search.
+    #[command(name = "create-search-index")]
+    CreateSearchIndex {
+        /// Mirror directory.
+        #[arg(value_parser)]
+        path: PathBuf,
     },
 
     /// Serve a mirror directory.
@@ -141,6 +150,7 @@ async fn main() {
             skip_rustup,
         } => mirror::sync(&path, vendor_path, cargo_lock_filepath, skip_rustup).await,
         Panamax::Rewrite { path, base_url } => mirror::rewrite(&path, base_url),
+        Panamax::CreateSearchIndex { path } => mirror::create_search_index(&path),
         Panamax::Serve {
             path,
             listen,

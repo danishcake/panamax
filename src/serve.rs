@@ -1,10 +1,9 @@
-use std::{collections::HashMap, io, net::SocketAddr, path::{Path, PathBuf}, process::Stdio};
+use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
 
 use askama::Template;
 use bytes::BytesMut;
 use futures_util::stream::TryStreamExt;
 use include_dir::{include_dir, Dir};
-use panamax_search_lib::Index;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -24,6 +23,7 @@ use warp::{
 };
 
 use crate::crates::get_crate_path;
+use crate::search::SearchIndex;
 
 pub struct TlsConfig {
     pub cert_path: PathBuf,
@@ -62,33 +62,40 @@ impl Reject for ServeError {}
 #[derive(Deserialize)]
 struct CratesSearch {
     q: String,
-    per_page: usize,
+    per_page: Option<usize>,
 }
 
-async fn search(p: &CratesSearch, path: &Path) -> Result<http::Response<String>, Rejection> {
-    if let Ok(index) = Index::load(path) {
-        let crates = index
-            .search(&[p.q.clone()], true)
-            .to_vec()
-            .into_iter()
-            .map(|crate_| Crate {
-                name: crate_.name,
-                description: crate_.description,
-                max_version: if let Some(v) = &crate_.latest_ny {
-                    v.to_string()
-                } else {
-                    String::from("0.0.0")
-                },
-            })
-            .collect::<Vec<_>>();
-        let meta = TotalCrates { total: crates.len() as u32 };
-        let crates = Crates { crates, meta };
-        let body = serde_json::to_string(&crates).unwrap();
-        if let Ok(res) = Response::builder().body(body) {
-            return Ok(res);
-        }
-    }
-    Err(warp::reject::not_found())
+async fn search(
+    p: &CratesSearch,
+    index: Option<&SearchIndex>,
+) -> Result<http::Response<String>, Rejection> {
+    // Search is unavailable until the explicit offline build command has created the database.
+    let Some(index) = index else {
+        return Err(warp::reject::not_found());
+    };
+
+    let results = index
+        .search(&p.q, p.per_page)
+        .map_err(|_| warp::reject::not_found())?;
+    // Convert the internal result type to Cargo's registry search response shape.
+    let crates = results
+        .crates
+        .into_iter()
+        .map(|crate_| Crate {
+            name: crate_.name,
+            description: crate_.description,
+            max_version: crate_.max_version,
+        })
+        .collect::<Vec<_>>();
+    let meta = TotalCrates {
+        total: results.total,
+    };
+    let body =
+        serde_json::to_string(&Crates { crates, meta }).map_err(|_| warp::reject::not_found())?;
+    Response::builder()
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .map_err(|_| warp::reject::not_found())
 }
 
 #[derive(Serialize)]
@@ -100,7 +107,7 @@ struct Crate {
 
 #[derive(Serialize)]
 struct TotalCrates {
-    total: u32,
+    total: usize,
 }
 
 #[derive(Serialize)]
@@ -112,6 +119,17 @@ struct Crates {
 pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<TlsConfig>) {
     let index_path = path.clone();
     let is_tls = tls_paths.is_some();
+    // Open the database once so requests do not parse JSON or scan mirror files.
+    let search_index = match SearchIndex::open(&path) {
+        Ok(index) => Some(Arc::new(index)),
+        Err(error) => {
+            eprintln!(
+                "Search index unavailable; run `panamax create-search-index {}`: {error}",
+                path.display()
+            );
+            None
+        }
+    };
 
     // Handle the homepage
     let index = warp::path::end().and(warp::host::optional()).and_then(
@@ -137,12 +155,12 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     );
 
     // Handle `cargo search` queries ("/crates?q={}&per_page={}")
-    let search_path = path.clone();
+    let search_index_for_route = search_index.clone();
     let crates_search = warp::path::path("crates")
         .and(warp::query::<CratesSearch>())
         .and_then(move |p: CratesSearch| {
-            let path = search_path.clone();
-            async move { search(&p, &path).await }
+            let search_index = search_index_for_route.clone();
+            async move { search(&p, search_index.as_deref()).await }
         });
 
     // Handle all files baked into the binary with include_dir, at /static

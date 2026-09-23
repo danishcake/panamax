@@ -27,6 +27,8 @@ Panamax is available as a docker image, so you can run:
 $ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax init /mirror
 (Modify /path/to/mirror/mirror.toml as needed)
 $ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax sync /mirror
+(Create the local cargo search database)
+$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax create-search-index /mirror
 (Once synced, serve the mirror)
 $ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) -p8080:8080 panamaxrs/panamax serve /mirror
 ```
@@ -90,6 +92,20 @@ $ cargo vendor
 $ panamax sync my-mirror vendor
 ```
 
+### Search Index
+
+Panamax can serve `cargo search` queries using a local SQLite database. Create it after
+synchronizing the mirror:
+
+```
+$ panamax create-search-index my-mirror
+Created search index at `my-mirror/search.db` with 12345 crates.
+```
+
+This reads the local `crates.io-index` and crate archives to generate `search.db`, and does not require access to the Internet.
+
+Run `create-search-index` again after synchronizing the mirror to refresh search data.
+
 ## Server
 
 Panamax provides a warp-based HTTP(S) server that can handle serving a Rust mirror fast and at scale. This is the recommended way to serve the mirror.
@@ -143,10 +159,18 @@ This will let you install `rustup` the similarly following the steps from https:
 registry = "http://panamax.internal/crates.io-index"
 [source.crates-io]
 replace-with = "my-mirror"
+
+[registries.panamax]
+index = "sparse+http://panamax.internal/index/"
 ```
 
 `Cargo` should now be pointing to the correct location to use the mirror.
 
+To search the mirror specify the `panamax` registry.
+
+```
+$ cargo search test --registry panamax --limit 10
+```
 ### Testing configuration
 
 You've now set up a Rust mirror! In order to make sure everything is set up properly, you can run a simple test:

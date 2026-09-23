@@ -36,6 +36,9 @@ pub enum MirrorError {
 
     #[error("Toml error: {0}")]
     Serialize(#[from] toml_edit::TomlError),
+
+    #[error("Search index error: {0}")]
+    Search(#[from] crate::search::SearchError),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -246,6 +249,19 @@ pub fn rewrite(path: &Path, base_url: Option<String>) -> Result<(), MirrorError>
     } else {
         eprintln!("Crates section missing in mirror.toml.");
     }
+
+    Ok(())
+}
+
+/// Build the offline SQLite database used by the cargo search endpoint.
+pub fn create_search_index(path: &Path) -> Result<(), MirrorError> {
+    // The builder reads only files already present in the mirror.
+    let stats = crate::search::build(path)?;
+    eprintln!(
+        "Created search index at `{}` with {} crates.",
+        path.join(crate::search::DATABASE_FILENAME).display(),
+        stats.crates,
+    );
 
     Ok(())
 }

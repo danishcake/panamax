@@ -6,6 +6,10 @@ Additionally when downloading files, a shared progress bar is used.
 
 Finally, a mirror.toml file is used to configure everything.
 
+The search component builds an offline `search.db` database from the local crates.io
+index and crate archives. The database is queried by the HTTP server and is copied as
+part of the mirror; request handling never rebuilds it.
+
 # Starting Points
 
 The two main commands, `init` and `sync`, are handled in the `init()` and `sync()` commands in mirror.rs.
@@ -33,3 +37,9 @@ When a mirror is downloading or updating, a progress bar is displayed. This file
 ### Mirror Configuration
 
 All details related to configuration file management is handled in `mirror.rs`. Serde is used to parse the `mirror.toml` file, with the root being the `Mirror` struct.
+
+### Search Index
+
+The `create-search-index` command and SQLite-backed query implementation are in
+`search.rs`. The command must be run after a mirror is synchronized and can run without
+network access.

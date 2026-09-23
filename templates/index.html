@@ -34,7 +34,14 @@ registry = "sparse+{{ host }}/index/"
 [source.crates-io]
 # To use sparse index, change "panamax" to "panamax-sparse".
 replace-with = "panamax"
+
+[registries.panamax]
+index = "sparse+{{ host }}/index/"
 EOT</pre>
+        </div>
+        <p>To search the mirror, use the registry configuration:</p>
+        <div class="copy-container">
+            <pre>cargo search test --registry panamax --limit 10</pre>
         </div>
         <p>Finally, run <code>rustup-init</code>, and you're done!</p>
         <select id="rustup-selected-platform" name="platform" onchange="platform_change()">
