@@ -6,7 +6,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use semver::Version;
 use serde::Deserialize;
 use tar::Archive;
@@ -20,6 +20,9 @@ pub const DATABASE_FILENAME: &str = "search.db";
 
 /// The database scheme version
 const DATABASE_SCHEMA_VERSION: i32 = 1;
+
+/// Metadata key containing the crates.io-index Git commit used to build the database.
+const INDEX_GIT_HASH_METADATA_KEY: &str = "index_git_hash";
 
 /// If not specified, the number of results to return per page
 const DEFAULT_PER_PAGE: usize = 10;
@@ -36,6 +39,9 @@ pub enum SearchError {
 
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("Git error: {0}")]
+    Git(#[from] git2::Error),
 
     #[error("Invalid crates.io index entry in {path} at line {line}: {source}")]
     IndexEntry {
@@ -116,7 +122,7 @@ impl SearchIndex {
             )));
         }
         let connection =
-            Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
         // Reject databases from an incompatible future schema instead of returning bad data.
         let schema_version: i32 =
@@ -125,6 +131,34 @@ impl SearchIndex {
             return Err(SearchError::InvalidDatabase(format!(
                 "unsupported schema version {schema_version}"
             )));
+        }
+
+        let stored_git_hash: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [INDEX_GIT_HASH_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current_git_hash = index_git_hash(mirror_path)?;
+        match stored_git_hash {
+            Some(stored_git_hash) if stored_git_hash == current_git_hash => {}
+            Some(stored_git_hash) => {
+                log::warn!(
+                    "Search database at `{}` was built from crates.io-index commit {}, but the current commit is {}. Rebuild it with `panamax create-search-index {}`.",
+                    database_path.display(),
+                    stored_git_hash,
+                    current_git_hash,
+                    mirror_path.display(),
+                );
+            }
+            None => {
+                log::warn!(
+                    "Search database at `{}` has no recorded crates.io-index Git commit. Rebuild it with `panamax create-search-index {}`.",
+                    database_path.display(),
+                    mirror_path.display(),
+                );
+            }
         }
 
         Ok(Self {
@@ -194,6 +228,7 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
             index_path.display()
         )));
     }
+    let index_git_hash = index_git_hash(mirror_path)?;
 
     // Open the database
     let database_path = mirror_path.join(DATABASE_FILENAME);
@@ -270,9 +305,21 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
+    transaction.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![INDEX_GIT_HASH_METADATA_KEY, index_git_hash],
+    )?;
     transaction.commit()?;
 
     Ok(stats)
+}
+
+/// Returns the commit currently checked out in the local crates.io-index repository.
+fn index_git_hash(mirror_path: &Path) -> Result<String, SearchError> {
+    let repository = git2::Repository::open(mirror_path.join("crates.io-index"))?;
+    let hash = repository.head()?.peel_to_commit()?.id().to_string();
+    Ok(hash)
 }
 
 /// Initializes the database
@@ -534,11 +581,22 @@ mod tests {
         )
         .unwrap();
         write_crate_archive(mirror_path, "foo", "1.2.0", "A useful foo crate.");
+        let git_hash = create_git_repo(mirror_path);
 
         let stats = build(mirror_path).unwrap();
         assert_eq!(stats.crates, 1);
         assert!(!mirror_path.join("search.db-journal").exists());
         assert!(!mirror_path.join("search.db-wal").exists());
+
+        let connection = Connection::open(mirror_path.join(DATABASE_FILENAME)).unwrap();
+        let stored_git_hash: String = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [INDEX_GIT_HASH_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_git_hash, git_hash);
 
         let index = SearchIndex::open(mirror_path).unwrap();
         let results = index.search("useful", None).unwrap();
@@ -569,6 +627,7 @@ mod tests {
             )
             .unwrap();
         }
+        create_git_repo(mirror_path);
         build(mirror_path).unwrap();
 
         let index = SearchIndex::open(mirror_path).unwrap();
@@ -576,6 +635,88 @@ mod tests {
         assert_eq!(results.total, 2);
         assert_eq!(results.crates.len(), 1);
         assert_eq!(results.crates[0].name, "foo");
+    }
+
+    #[test]
+    fn opens_stale_index_with_warning() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            "{\"name\":\"foo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+        )
+        .unwrap();
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            concat!(
+                "{\"name\":\"foo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                "{\"name\":\"foo\",\"vers\":\"2.0.0\",\"yanked\":false}\n"
+            ),
+        )
+        .unwrap();
+        create_git_repo(mirror_path);
+
+        // A changed index is warned about but remains available until explicitly rebuilt.
+        let index = SearchIndex::open(mirror_path).unwrap();
+        let results = index.search("foo", None).unwrap();
+        assert_eq!(results.total, 1);
+        assert_eq!(results.crates[0].max_version, "1.0.0");
+    }
+
+    #[test]
+    fn opens_database_without_git_hash_with_warning() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            "{\"name\":\"foo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+        )
+        .unwrap();
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        let connection = Connection::open(mirror_path.join(DATABASE_FILENAME)).unwrap();
+        connection
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                [INDEX_GIT_HASH_METADATA_KEY],
+            )
+            .unwrap();
+
+        assert!(SearchIndex::open(mirror_path).is_ok());
+    }
+
+    /// Creates a git repo in `mirror_path` and return the commit hash
+    fn create_git_repo(mirror_path: &Path) -> String {
+        let repository = git2::Repository::init(mirror_path.join("crates.io-index")).unwrap();
+        let mut index = repository.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Panamax test", "test@panamax").unwrap();
+        let parent = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.as_ref().into_iter().collect::<Vec<_>>();
+        let commit = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Update index",
+                &tree,
+                &parents,
+            )
+            .unwrap();
+        commit.to_string()
     }
 
     fn write_crate_archive(mirror_path: &Path, name: &str, version: &str, description: &str) {
