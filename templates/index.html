@@ -1,10 +1,10 @@
 <head>
     <meta charset="utf-8">
     <title>Panamax</title>
-    <link rel="stylesheet" href="static/css/normalize.css">
-    <link rel="stylesheet" href="static/css/rustup.css">
-    <link rel="stylesheet" href="static/css/panamax.css">
-    <script src="static/js/panamax.js"></script>
+    <link rel="stylesheet" href="/static/css/normalize.css">
+    <link rel="stylesheet" href="/static/css/rustup.css">
+    <link rel="stylesheet" href="/static/css/panamax.css">
+    <script src="/static/js/panamax.js"></script>
 </head>
 
 <body id="idx" onload="platform_change()">
@@ -53,6 +53,16 @@ EOT</pre>
 chmod +x rustup-init
 ./rustup-init</pre>
         </div>
+    </div>
+    <div class="search-pane">
+        <h2>Search crates</h2>
+        <form action="/search.html" method="get" class="crate-search-form">
+            <label for="homepage-search">Crate name or description</label>
+            <div class="search-controls">
+                <input id="homepage-search" type="search" name="q" required>
+                <button type="submit">Search</button>
+            </div>
+        </form>
     </div>
     <div class="display-none" id="panamax-host">{{ host }}</div>
 </body>

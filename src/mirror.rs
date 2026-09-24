@@ -395,7 +395,7 @@ pub(crate) async fn verify(
 
     // Getting crates.sync config state
     let crates_config = config.crates.as_ref();
-    let sync = crates_config.map_or(false, |crate_config| crate_config.sync);
+    let sync = crates_config.is_some_and(|crate_config| crate_config.sync);
 
     // Determining number of steps
     let steps = if dry_run || !sync { 1 } else { 2 };

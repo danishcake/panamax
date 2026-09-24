@@ -1,0 +1,81 @@
+<head>
+    <meta charset="utf-8">
+    <title>Search crates - Panamax</title>
+    <link rel="stylesheet" href="/static/css/normalize.css">
+    <link rel="stylesheet" href="/static/css/rustup.css">
+    <link rel="stylesheet" href="/static/css/panamax.css">
+</head>
+
+<body class="browser-page">
+    <main class="browser-content">
+        <p class="page-kicker"><a href="/">Panamax</a> / crate search</p>
+        <h1>Search crates</h1>
+        <form action="/search.html" method="get" class="crate-search-form">
+            <label for="search-query">Crate name or description</label>
+            <div class="search-controls">
+                <input id="search-query" type="search" name="q" value="{{ query }}" autofocus>
+                <button type="submit">Search</button>
+            </div>
+        </form>
+
+        {% if search_unavailable %}
+        <p class="notice">Crate search is not available. Build the search database with
+            <code>panamax create-search-index &lt;mirror&gt;</code>.</p>
+        {% else if query.is_empty() %}
+        <p class="notice">Enter a search term to find crates in this mirror.</p>
+        {% else %}
+        <p class="result-summary">{{ total }} matching crate{% if total != 1 %}s{% endif %}.</p>
+        {% if total_pages > 1 %}
+        <nav class="pagination" aria-label="Search result pages">
+            {% if page > 1 %}
+            <form action="/search.html" method="get">
+                <input type="hidden" name="q" value="{{ query }}">
+                <button type="submit" name="page" value="{{ page - 1 }}">Previous</button>
+            </form>
+            {% endif %}
+            <span>Page {{ page }} of {{ total_pages }}</span>
+            {% if page < total_pages %}
+            <form action="/search.html" method="get">
+                <input type="hidden" name="q" value="{{ query }}">
+                <button type="submit" name="page" value="{{ page + 1 }}">Next</button>
+            </form>
+            {% endif %}
+        </nav>
+        {% endif %}
+        {% if results.is_empty() %}
+        <p class="notice">No crates matched <strong>{{ query }}</strong>.</p>
+        {% else %}
+        <ul class="crate-results">
+            {% for result in results %}
+            <li class="crate-result">
+                <h2><a href="/crate/{{ result.name }}">{{ result.name }}</a></h2>
+                <p class="crate-version">Latest version: {{ result.max_version }}</p>
+                {% if let Some(description) = result.description %}
+                <p>{{ description }}</p>
+                {% else %}
+                <p class="muted">No description available.</p>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+        {% if total_pages > 1 %}
+        <nav class="pagination" aria-label="Search result pages">
+            {% if page > 1 %}
+            <form action="/search.html" method="get">
+                <input type="hidden" name="q" value="{{ query }}">
+                <button type="submit" name="page" value="{{ page - 1 }}">Previous</button>
+            </form>
+            {% endif %}
+            <span>Page {{ page }} of {{ total_pages }}</span>
+            {% if page < total_pages %}
+            <form action="/search.html" method="get">
+                <input type="hidden" name="q" value="{{ query }}">
+                <button type="submit" name="page" value="{{ page + 1 }}">Next</button>
+            </form>
+            {% endif %}
+        </nav>
+        {% endif %}
+        {% endif %}
+    </main>
+</body>

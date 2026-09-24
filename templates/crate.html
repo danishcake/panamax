@@ -1,0 +1,95 @@
+<head>
+    <meta charset="utf-8">
+    <title>{{ details.name }} - Panamax</title>
+    <link rel="stylesheet" href="/static/css/normalize.css">
+    <link rel="stylesheet" href="/static/css/rustup.css">
+    <link rel="stylesheet" href="/static/css/panamax.css">
+</head>
+
+<body class="browser-page">
+    <main class="browser-content">
+        <p class="page-kicker"><a href="/">Panamax</a> / <a href="/search.html">crate search</a> / {{ details.name }}</p>
+        <h1>{{ details.name }}</h1>
+        {% if let Some(description) = details.metadata.description %}
+        <p class="crate-description">{{ description }}</p>
+        {% else %}
+        <p class="muted">No description available.</p>
+        {% endif %}
+        {% if details.latest_available_version.is_none() %}
+        <p class="notice">This mirror has the crate index entry but no local crate archive. Archive metadata and download links are unavailable.</p>
+        {% endif %}
+
+        <section class="detail-section">
+            <h2>Versions</h2>
+            <dl class="metadata-list">
+                <dt>Latest version</dt>
+                <dd>{{ details.max_version }}</dd>
+                {% if let Some(version) = details.latest_available_version %}
+                <dt>Latest available</dt>
+                <dd>{{ version }}</dd>
+                {% endif %}
+                {% if let Some(version) = details.latest_yanked_version %}
+                <dt>Latest yanked version</dt>
+                <dd>{{ version }}</dd>
+                {% endif %}
+            </dl>
+        </section>
+
+        {% if !details.available_versions.is_empty() %}
+        <section class="detail-section">
+            <h2>Available downloads</h2>
+            <ul class="dependency-list">
+                {% for version in details.available_versions %}
+                <li>
+                    <a href="/crates/{{ details.name }}/{{ version.version }}/download">{{ version.version }}</a>
+                    {% if version.yanked %}<small>(yanked)</small>{% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
+        <section class="detail-section">
+            <h2>Package information</h2>
+            <dl class="metadata-list">
+                {% if !details.metadata.authors.is_empty() %}
+                <dt>Authors</dt>
+                <dd>{{ details.metadata.authors|join(", ") }}</dd>
+                {% endif %}
+                {% if let Some(license) = details.metadata.license %}
+                <dt>License</dt>
+                <dd>{{ license }}</dd>
+                {% endif %}
+                {% if let Some(repository) = details.metadata.repository %}
+                <dt>Repository</dt>
+                <dd>{% if details.metadata.is_http_url(repository) %}<a href="{{ repository }}">{{ repository }}</a>{% else %}{{ repository }}{% endif %}</dd>
+                {% endif %}
+                {% if let Some(homepage) = details.metadata.homepage %}
+                <dt>Homepage</dt>
+                <dd>{% if details.metadata.is_http_url(homepage) %}<a href="{{ homepage }}">{{ homepage }}</a>{% else %}{{ homepage }}{% endif %}</dd>
+                {% endif %}
+                {% if let Some(documentation) = details.metadata.documentation %}
+                <dt>Documentation</dt>
+                <dd>{% if details.metadata.is_http_url(documentation) %}<a href="{{ documentation }}">{{ documentation }}</a>{% else %}{{ documentation }}{% endif %}</dd>
+                {% endif %}
+            </dl>
+            {% if !details.metadata.keywords.is_empty() %}
+            <p><strong>Keywords:</strong> {{ details.metadata.keywords|join(", ") }}</p>
+            {% endif %}
+            {% if !details.metadata.categories.is_empty() %}
+            <p><strong>Categories:</strong> {{ details.metadata.categories|join(", ") }}</p>
+            {% endif %}
+        </section>
+
+        {% if !details.metadata.dependencies.is_empty() %}
+        <section class="detail-section">
+            <h2>Dependencies</h2>
+            <ul class="dependency-list">
+                {% for dependency in details.metadata.dependencies %}
+                <li><a href="/crate/{{ dependency.name }}"><code>{{ dependency.name }}</code></a> <span>{{ dependency.requirement }}</span> <small>({{ dependency.kind }})</small></li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+    </main>
+</body>

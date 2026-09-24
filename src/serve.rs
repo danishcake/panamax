@@ -23,7 +23,7 @@ use warp::{
 };
 
 use crate::crates::get_crate_path;
-use crate::search::SearchIndex;
+use crate::search::{CrateDetails, SearchIndex, SearchResult};
 
 pub struct TlsConfig {
     pub cert_path: PathBuf,
@@ -41,6 +41,23 @@ pub struct Platform {
 struct IndexTemplate {
     platforms: Vec<Platform>,
     host: String,
+}
+
+#[derive(Template)]
+#[template(path = "search.html")]
+struct SearchTemplate {
+    query: String,
+    results: Vec<SearchResult>,
+    total: usize,
+    page: usize,
+    total_pages: usize,
+    search_unavailable: bool,
+}
+
+#[derive(Template)]
+#[template(path = "crate.html")]
+struct CrateTemplate {
+    details: CrateDetails,
 }
 
 const STATIC_DIR: Dir = include_dir!("static");
@@ -98,6 +115,61 @@ async fn search(
         .map_err(|_| warp::reject::not_found())
 }
 
+async fn browser_search(
+    params: BrowserSearch,
+    index: Option<Arc<SearchIndex>>,
+) -> Result<SearchTemplate, Rejection> {
+    let query = params.q.unwrap_or_default().trim().to_string();
+    let requested_page = params.page.unwrap_or(1);
+    let Some(index) = index else {
+        return Ok(SearchTemplate {
+            query,
+            results: Vec::new(),
+            total: 0,
+            page: 1,
+            total_pages: 1,
+            search_unavailable: true,
+        });
+    };
+
+    if query.is_empty() {
+        return Ok(SearchTemplate {
+            query,
+            results: Vec::new(),
+            total: 0,
+            page: 1,
+            total_pages: 1,
+            search_unavailable: false,
+        });
+    }
+
+    let results = index
+        .search_page(&query, Some(BROWSER_SEARCH_PER_PAGE), requested_page)
+        .map_err(|_| warp::reject::not_found())?;
+    Ok(SearchTemplate {
+        query,
+        results: results.crates,
+        total: results.total,
+        page: results.page,
+        total_pages: results.total_pages,
+        search_unavailable: false,
+    })
+}
+
+async fn browser_crate(
+    name: String,
+    index: Option<Arc<SearchIndex>>,
+) -> Result<CrateTemplate, Rejection> {
+    let Some(index) = index else {
+        return Err(warp::reject::not_found());
+    };
+    let details = index
+        .crate_details(&name)
+        .map_err(|_| warp::reject::not_found())?
+        .ok_or_else(warp::reject::not_found)?;
+    Ok(CrateTemplate { details })
+}
+
 #[derive(Serialize)]
 struct Crate {
     name: String,
@@ -115,6 +187,14 @@ struct Crates {
     crates: Vec<Crate>,
     meta: TotalCrates,
 }
+
+#[derive(Deserialize)]
+struct BrowserSearch {
+    q: Option<String>,
+    page: Option<usize>,
+}
+
+const BROWSER_SEARCH_PER_PAGE: usize = 100;
 
 pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<TlsConfig>) {
     let index_path = path.clone();
@@ -153,6 +233,18 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
             }
         },
     );
+
+    // Handle the browser search page and crate detail pages separately from Cargo's JSON API.
+    let search_page_index = search_index.clone();
+    let browser_search_page = warp::path("search.html")
+        .and(warp::query::<BrowserSearch>())
+        .and(warp::any().map(move || search_page_index.clone()))
+        .and_then(browser_search);
+
+    let crate_page_index = search_index.clone();
+    let browser_crate_page = warp::path!("crate" / String)
+        .and(warp::any().map(move || crate_page_index.clone()))
+        .and_then(browser_crate);
 
     // Handle `cargo search` queries ("/crates?q={}&per_page={}")
     let search_index_for_route = search_index.clone();
@@ -266,6 +358,8 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     let sparse_index = warp::path("index").and(warp::fs::dir(path.join("crates.io-index")));
 
     let routes = index
+        .or(browser_search_page)
+        .or(browser_crate_page)
         .or(static_dir)
         .or(dist_dir)
         .or(rustup_dir)
@@ -353,6 +447,14 @@ async fn get_crate_file(
     let mut resp = Response::new(body);
     resp.headers_mut()
         .insert(http::header::CONTENT_LENGTH, meta.len().into());
+    let filename = format!("{name}-{version}.crate")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let content_disposition =
+        http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|_| warp::reject::not_found())?;
+    resp.headers_mut()
+        .insert(http::header::CONTENT_DISPOSITION, content_disposition);
 
     Ok(resp)
 }
@@ -462,5 +564,98 @@ async fn send_git(
             return Ok(());
         }
         sender.send_data(bytes_out.freeze()).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use askama::Template;
+
+    #[test]
+    fn search_template_escapes_query_and_links_results() {
+        let template = SearchTemplate {
+            query: "<serde>".to_string(),
+            results: vec![SearchResult {
+                name: "serde".to_string(),
+                description: Some("Serialization & deserialization".to_string()),
+                max_version: "1.0.0".to_string(),
+            }],
+            total: 1,
+            page: 1,
+            total_pages: 3,
+            search_unavailable: false,
+        };
+
+        let rendered = template.render().unwrap();
+        assert!(rendered.contains("value=\"&lt;serde&gt;\""));
+        assert!(rendered.contains("href=\"/crate/serde\""));
+        assert!(rendered.contains("Serialization &amp; deserialization"));
+        assert_eq!(rendered.matches("Page 1 of 3").count(), 2);
+        assert!(rendered.contains("name=\"q\" value=\"&lt;serde&gt;\""));
+        assert_eq!(rendered.matches("name=\"page\" value=\"2\"").count(), 2);
+    }
+
+    #[test]
+    fn crate_template_renders_metadata_and_download_link() {
+        let template = CrateTemplate {
+            details: CrateDetails {
+                name: "serde".to_string(),
+                max_version: "1.0.0".to_string(),
+                latest_yanked_version: Some("0.9.0".to_string()),
+                latest_available_version: Some("1.0.0".to_string()),
+                available_versions: vec![crate::search::AvailableVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                }],
+                metadata: crate::search::CrateMetadata {
+                    description: Some("Serialization framework".to_string()),
+                    authors: vec!["The Serde team".to_string()],
+                    license: Some("MIT OR Apache-2.0".to_string()),
+                    repository: Some("https://github.com/serde-rs/serde".to_string()),
+                    homepage: Some("javascript:alert(1)".to_string()),
+                    documentation: Some("data:text/html,unsafe".to_string()),
+                    keywords: vec!["serialization".to_string()],
+                    categories: vec!["encoding".to_string()],
+                    dependencies: vec![crate::search::Dependency {
+                        name: "serde_derive".to_string(),
+                        requirement: "1".to_string(),
+                        kind: "dependencies".to_string(),
+                    }],
+                },
+            },
+        };
+
+        let rendered = template.render().unwrap();
+        assert!(rendered.contains("/crates/serde/1.0.0/download"));
+        assert!(rendered.contains("MIT OR Apache-2.0"));
+        assert!(rendered.contains("href=\"https://github.com/serde-rs/serde\""));
+        assert!(rendered.contains("javascript:alert(1)"));
+        assert!(rendered.contains("data:text/html,unsafe"));
+        assert!(!rendered.contains("href=\"javascript:alert(1)\""));
+        assert!(!rendered.contains("href=\"data:text/html,unsafe\""));
+        assert!(rendered.contains("href=\"/crate/serde_derive\""));
+        assert!(rendered.contains("serde_derive"));
+    }
+
+    #[tokio::test]
+    async fn crate_download_sets_archive_filename() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let crate_path = get_crate_path(temporary_directory.path(), "foo", "1.2.3").unwrap();
+        fs::create_dir_all(crate_path.parent().unwrap()).unwrap();
+        fs::write(&crate_path, b"crate contents").unwrap();
+
+        let response = get_crate_file(temporary_directory.path().to_path_buf(), "foo", "1.2.3")
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_DISPOSITION)
+                .unwrap(),
+            "attachment; filename=\"foo-1.2.3.crate\""
+        );
     }
 }

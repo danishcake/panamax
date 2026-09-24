@@ -1,5 +1,6 @@
 use std::{
-    fs::File,
+    collections::HashMap,
+    fs::{read_dir, File},
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -8,7 +9,7 @@ use std::{
 use flate2::read::GzDecoder;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tar::Archive;
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -19,7 +20,7 @@ use crate::crates::get_crate_path;
 pub const DATABASE_FILENAME: &str = "search.db";
 
 /// The database scheme version
-const DATABASE_SCHEMA_VERSION: i32 = 1;
+const DATABASE_SCHEMA_VERSION: i32 = 2;
 
 /// Metadata key containing the crates.io-index Git commit used to build the database.
 const INDEX_GIT_HASH_METADATA_KEY: &str = "index_git_hash";
@@ -42,6 +43,9 @@ pub enum SearchError {
 
     #[error("Git error: {0}")]
     Git(#[from] git2::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 
     #[error("Invalid crates.io index entry in {path} at line {line}: {source}")]
     IndexEntry {
@@ -78,36 +82,136 @@ struct IndexEntry {
     /// If the entry has been yanked
     #[serde(default)]
     yanked: bool,
+    /// Dependencies recorded in the crates.io index.
+    #[serde(default)]
+    deps: Vec<IndexDependency>,
 }
 
-#[derive(Debug)]
+/// A dependency of a crate, extracted from the index rather than a crate
+#[derive(Debug, Clone, Deserialize)]
+struct IndexDependency {
+    /// Name of the dependency
+    name: String,
+
+    /// The version
+    req: String,
+
+    /// Manifest section containing the dependency
+    #[serde(default)]
+    kind: String,
+}
+
+#[derive(Debug, Clone)]
 struct VersionEntry {
     version: Version,
     yanked: bool,
 }
 
+/// The data about a crate
 #[derive(Debug)]
 struct CrateRecord {
+    /// The name of the crate
     name: String,
+
+    /// The latest version of the crate in the index. If panamax is synced from a
+    /// vendored directory it may not be available to download
     latest_version: Option<String>,
+
+    /// The latest yanked version of the crate in the index
     latest_yanked_version: Option<String>,
-    description: Option<String>,
+
+    /// The latest version of the crate that is actually available
+    latest_available_version: Option<String>,
+
+    /// The full list of versions of the crate that are available
+    available_versions: Vec<AvailableVersion>,
+
+    /// Metadata about a crate
+    metadata: CrateMetadata,
 }
 
-#[derive(Debug, Deserialize)]
-struct Manifest {
-    package: Option<ManifestPackage>,
-    project: Option<ManifestPackage>,
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AvailableVersion {
+    /// Version present as a local crate archive.
+    pub version: String,
+    /// Whether this version is yanked in the crates.io index.
+    pub yanked: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct ManifestPackage {
-    description: Option<String>,
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Dependency {
+    /// Dependency name.
+    pub name: String,
+    /// Cargo requirement or manifest declaration for the dependency.
+    pub requirement: String,
+    /// Manifest section containing the dependency.
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CrateMetadata {
+    /// The description of the crate
+    pub description: Option<String>,
+
+    /// The authors of the crate
+    pub authors: Vec<String>,
+
+    /// The license of the crate
+    pub license: Option<String>,
+
+    /// The source repository of the crate
+    pub repository: Option<String>,
+
+    /// The homepage of the crate
+    pub homepage: Option<String>,
+
+    /// The documentation URL
+    pub documentation: Option<String>,
+
+    /// A set of keywords to associate with the crate
+    pub keywords: Vec<String>,
+
+    /// The categories the crate belongs to
+    pub categories: Vec<String>,
+
+    /// The dependencies of the crate
+    pub dependencies: Vec<Dependency>,
+}
+
+impl CrateMetadata {
+    /// Return the metadata fields that should be included in crate search.
+    fn searchable_fields(&self) -> (String, String) {
+        (self.keywords.join(" "), self.categories.join(" "))
+    }
+
+    /// Whether a metadata URL is an absolute HTTP or HTTPS URL suitable for linking.
+    pub fn is_http_url(&self, value: &str) -> bool {
+        url::Url::parse(value)
+            .map(|url| matches!(url.scheme(), "http" | "https"))
+            .unwrap_or(false)
+    }
 }
 
 /// Read-only access to a mirror's prebuilt search database.
 pub struct SearchIndex {
     connection: Mutex<Connection>,
+}
+
+/// Details stored for one crate in the local search database.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CrateDetails {
+    /// Crate name.
+    pub name: String,
+    /// Latest non-yanked version, or Cargo's `0.0.0` fallback.
+    pub max_version: String,
+    /// Latest yanked version, if one exists.
+    pub latest_yanked_version: Option<String>,
+    /// Latest version whose archive is available in the mirror.
+    pub latest_available_version: Option<String>,
+    /// Every crate archive available in the mirror.
+    pub available_versions: Vec<AvailableVersion>,
+    /// Manifest and index metadata for the crate.
+    pub metadata: CrateMetadata,
 }
 
 impl SearchIndex {
@@ -172,6 +276,17 @@ impl SearchIndex {
         query: &str,
         per_page: Option<usize>,
     ) -> Result<SearchResults, SearchError> {
+        self.search_page(query, per_page, 1)
+    }
+
+    /// Search one 1-based page of results. Cargo's search endpoint uses `search()` so its
+    /// existing first-page behavior remains unchanged.
+    pub fn search_page(
+        &self,
+        query: &str,
+        per_page: Option<usize>,
+        page: usize,
+    ) -> Result<SearchResults, SearchError> {
         // Clamp caller-provided values so an HTTP client cannot request an unbounded page.
         let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
         let connection = self.connection.lock().map_err(|_| {
@@ -181,16 +296,63 @@ impl SearchIndex {
         let query = query.trim();
         if query.is_empty() {
             // TODO explain
-            return query_database(&connection, None, query, per_page);
+            query_database(&connection, None, query, per_page, page)
         } else if query.chars().count() < 3 {
             // FTS5's trigram tokenizer cannot index one- or two-character terms.
             let pattern = like_literal_pattern(query);
-            query_database(&connection, Some(&pattern), query, per_page)
+            query_database(&connection, Some(&pattern), query, per_page, page)
         } else {
             // Quote the user input so FTS5 syntax cannot be injected through the query string.
             let fts_query = fts_literal_query(query);
-            query_database(&connection, Some(&fts_query), query, per_page)
+            query_database(&connection, Some(&fts_query), query, per_page, page)
         }
+    }
+
+    /// Look up a crate by name without matching descriptions or dependencies.
+    pub fn crate_details(&self, name: &str) -> Result<Option<CrateDetails>, SearchError> {
+        let connection = self.connection.lock().map_err(|_| {
+            SearchError::InvalidDatabase("search database lock was poisoned".into())
+        })?;
+        let row = connection
+            .query_row(
+                "SELECT name, latest_version, latest_yanked_version, latest_available_version,
+                        available_versions, details
+                 FROM crates WHERE lower(name) = lower(?1)",
+                [name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            name,
+            latest_version,
+            latest_yanked_version,
+            latest_available_version,
+            available_versions,
+            details,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let metadata: CrateMetadata = serde_json::from_str(&details)?;
+        let available_versions: Vec<AvailableVersion> = serde_json::from_str(&available_versions)?;
+
+        Ok(Some(CrateDetails {
+            name,
+            max_version: latest_version.unwrap_or_else(|| "0.0.0".to_string()),
+            latest_yanked_version,
+            latest_available_version,
+            available_versions,
+            metadata,
+        }))
     }
 }
 
@@ -248,11 +410,16 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
 
     // Creates prepared statements to insert rows
     let mut crate_insert = transaction.prepare(
-        "INSERT INTO crates (name, description, latest_version, latest_yanked_version)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO crates (
+            name, description, latest_version, latest_yanked_version,
+            latest_available_version, available_versions, details,
+            search_keywords, search_categories
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
-    let mut search_insert = transaction
-        .prepare("INSERT INTO crate_search (crate_id, name, description) VALUES (?1, ?2, ?3)")?;
+    let mut search_insert = transaction.prepare(
+        "INSERT INTO crate_search (crate_id, name, description, keywords, categories)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
 
     // Track the number of crates indexed
     let mut stats = BuildStats::default();
@@ -268,8 +435,7 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
             entry.depth() > 1
         }
     }) {
-        let entry =
-            entry.map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -281,17 +447,31 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
         };
 
         // Add to the database
+        let details = serde_json::to_string(&record.metadata)?;
+        let (keywords, categories) = record.metadata.searchable_fields();
+        let available_versions = serde_json::to_string(&record.available_versions)?;
         crate_insert.execute(params![
             record.name,
-            record.description,
+            record.metadata.description,
             record.latest_version,
             record.latest_yanked_version,
+            record.latest_available_version,
+            available_versions,
+            details,
+            keywords,
+            categories,
         ])?;
 
         // The FTS table stores the row ID so query results can recover full crate metadata.
         // We can't use a proper foreign key constraint here
         let crate_id = transaction.last_insert_rowid();
-        search_insert.execute(params![crate_id, record.name, record.description])?;
+        search_insert.execute(params![
+            crate_id,
+            record.name,
+            record.metadata.description,
+            keywords,
+            categories,
+        ])?;
         stats.crates += 1;
     }
 
@@ -324,6 +504,17 @@ fn index_git_hash(mirror_path: &Path) -> Result<String, SearchError> {
 
 /// Initializes the database
 fn initialize_schema(connection: &Connection) -> Result<(), SearchError> {
+    let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version != DATABASE_SCHEMA_VERSION {
+        // Building replaces every row, so recreating the schema is safe for both
+        // older databases and databases from a newer incompatible build.
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS crate_search;
+             DROP TABLE IF EXISTS crates;
+             DROP TABLE IF EXISTS metadata;",
+        )?;
+    }
+
     // The trigram tokenizer provides indexed substring matching for names and descriptions.
     connection.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS crates (
@@ -331,13 +522,20 @@ fn initialize_schema(connection: &Connection) -> Result<(), SearchError> {
             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
             description TEXT,
             latest_version TEXT,
-            latest_yanked_version TEXT
+            latest_yanked_version TEXT,
+            latest_available_version TEXT,
+            available_versions TEXT NOT NULL,
+            details TEXT NOT NULL,
+            search_keywords TEXT NOT NULL,
+            search_categories TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS crates_name_idx ON crates(name COLLATE NOCASE);
         CREATE VIRTUAL TABLE IF NOT EXISTS crate_search USING fts5(
             crate_id UNINDEXED,
             name,
             description,
+            keywords,
+            categories,
             tokenize = 'trigram'
         );
         CREATE TABLE IF NOT EXISTS metadata (
@@ -350,11 +548,36 @@ fn initialize_schema(connection: &Connection) -> Result<(), SearchError> {
 }
 
 /// Reads a crate from the index
+/// An index file consists of a series of JSON objects, one per line. Each line represents
+/// a published version of the crate. Expanded, they look like this:
+///
+/// {
+///   "name":"a",
+///   "vers":"0.1.0",
+///   "deps":[
+///     {"name":"base64","req":"^0.22","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal"},
+///     {"name":"chrono","req":"^0.4","features":["serde"],"optional":false,"default_features":true,"target":null,"kind":"normal"},
+///     {"name":"serde","req":"^1","features":["derive"],"optional":true,"default_features":true,"target":null,"kind":"normal"},
+///     {"name":"sm4","req":"^0.5","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal"},
+///     {"name":"thiserror","req":"^2","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal"}
+///   ],
+///   "cksum":"58169884a52f5647006cc1d663adb1432a948a8af1a28379880274d0b7a160e8",
+///   "features":{"default":[]},
+///   "features2":{"serde":["dep:serde","chrono/serde"],
+///   "sm4":["dep:sm4","dep:base64"]},
+///   "yanked":false,
+///   "pubtime":"2026-01-15T12:53:12Z",
+///   "v":2
+/// }
+///
+/// This data is suplemented by reading metadata from the latest version of the crate available
 fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord>, SearchError> {
     let file = BufReader::new(File::open(path)?);
     let mut crate_name = None;
     let mut latest_version = None;
     let mut latest_yanked_version = None;
+    let mut versions = Vec::new();
+    let mut latest_index_dependencies = Vec::new();
 
     // Each index file contains all published versions for one crate.
     for (line_number, line) in file.lines().enumerate() {
@@ -379,6 +602,16 @@ fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord
             version,
             yanked: index_entry.yanked,
         };
+        versions.push(candidate.clone());
+        let index_dependencies = index_entry
+            .deps
+            .iter()
+            .map(|dependency| Dependency {
+                name: dependency.name.clone(),
+                requirement: dependency.req.clone(),
+                kind: dependency.kind.clone(),
+            })
+            .collect::<Vec<_>>();
         // Keep only the two candidates needed by the search response.
         let latest = if candidate.yanked {
             &mut latest_yanked_version
@@ -391,49 +624,122 @@ fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord
             .unwrap_or(true)
         {
             *latest = Some(candidate);
+            if !index_entry.yanked {
+                latest_index_dependencies = index_dependencies;
+            }
         }
     }
 
+    // If the crate name could not be identified then return None.
     let Some(crate_name) = crate_name else {
         return Ok(None);
     };
-    // Descriptions come from the newest usable local archive, not from the index metadata.
-    let description_version = latest_version.as_ref().or(latest_yanked_version.as_ref());
-    let description = description_version.and_then(|entry| {
-        match read_description(mirror_path, &crate_name, &entry.version) {
-            Ok(description) => description,
+    let available_versions = local_versions(mirror_path, &crate_name, &versions)?;
+
+    // Metadata is read from the downloaded crates
+    // Identify the latest version available, prioritising non-yanked
+    let mut latest_available_version = available_versions
+        .iter()
+        .find(|entry| !entry.yanked)
+        .map(|entry| entry.version.clone());
+    if latest_available_version.is_none() {
+        latest_available_version = available_versions
+            .first()
+            .map(|entry| entry.version.clone());
+    }
+
+    // Work through the available versions from latest to oldest. Attempt to extract
+    // metadata from each version, terminating as soon as one succeeds
+    let mut metadata = CrateMetadata::default();
+    for entry in &available_versions {
+        match read_manifest_metadata(mirror_path, &crate_name, &entry.version) {
+            Ok(Some(candidate_metadata)) => {
+                metadata = candidate_metadata;
+                break;
+            }
+            Ok(None) => {}
             Err(error) => {
                 log::warn!(
-                    "Could not read description for {crate_name} {}: {error}",
+                    "Could not read metadata for {crate_name} {}: {error}",
                     entry.version
                 );
-                None
             }
         }
-    });
+    }
+    if metadata.dependencies.is_empty() {
+        metadata.dependencies = latest_index_dependencies;
+    }
 
     Ok(Some(CrateRecord {
         name: crate_name,
         latest_version: latest_version.map(|entry| entry.version.to_string()),
         latest_yanked_version: latest_yanked_version.map(|entry| entry.version.to_string()),
-        description,
+        latest_available_version,
+        available_versions,
+        metadata,
     }))
 }
 
-/// Reads the description for a given crate
-fn read_description(
+/// Lists crate archives that are actually present in the mirror.
+fn local_versions(
     mirror_path: &Path,
     crate_name: &str,
-    version: &Version,
-) -> Result<Option<String>, SearchError> {
+    index_versions: &[VersionEntry],
+) -> Result<Vec<AvailableVersion>, SearchError> {
+    let sample_path = get_crate_path(mirror_path, crate_name, "0.0.0")
+        .ok_or_else(|| io::Error::other(format!("invalid crate name: {crate_name}")))?;
+    let crate_directory = sample_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("invalid crate archive path"))?;
+    let yanked_versions = index_versions
+        .iter()
+        .map(|entry| (entry.version.to_string(), entry.yanked))
+        .collect::<HashMap<_, _>>();
+
+    let entries = match read_dir(crate_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut available_versions = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let version = entry.file_name().to_string_lossy().into_owned();
+        let Ok(parsed_version) = Version::parse(&version) else {
+            continue;
+        };
+        let archive = entry.path().join(format!("{crate_name}-{version}.crate"));
+        if archive.is_file() {
+            available_versions.push((
+                parsed_version,
+                yanked_versions.get(&version).copied().unwrap_or(false),
+            ));
+        }
+    }
+    available_versions.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
+    Ok(available_versions
+        .into_iter()
+        .map(|(version, yanked)| AvailableVersion {
+            version: version.to_string(),
+            yanked,
+        })
+        .collect())
+}
+
+/// Reads searchable and displayable metadata for a given crate from the Cargo.toml file.
+/// This data is only available for downloaded crates
+fn read_manifest_metadata(
+    mirror_path: &Path,
+    crate_name: &str,
+    version: &str,
+) -> Result<Option<CrateMetadata>, SearchError> {
     // Selective mirrors may not contain the archive, which is a valid no-description case.
-    let crate_path =
-        get_crate_path(mirror_path, crate_name, &version.to_string()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("invalid crate name: {crate_name}"),
-            )
-        })?;
+    let crate_path = get_crate_path(mirror_path, crate_name, version)
+        .ok_or_else(|| io::Error::other(format!("invalid crate name: {crate_name}")))?;
     let file = match File::open(crate_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -463,16 +769,61 @@ fn read_description(
 
         let mut contents = String::new();
         entry.read_to_string(&mut contents)?;
-        let manifest: Manifest = toml_edit::easy::from_str(&contents)
+        let manifest = contents
+            .parse::<toml_edit::Document>()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        // `project` supports older crate manifests used by the original search implementation.
-        return Ok(manifest
-            .package
-            .or(manifest.project)
-            .and_then(|package| package.description));
+        let Some(package) = manifest
+            .get("package")
+            .or_else(|| manifest.get("project"))
+            .and_then(|item| item.as_table())
+        else {
+            return Ok(Some(CrateMetadata::default()));
+        };
+
+        let string_field = |name: &str| {
+            package
+                .get(name)
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+        };
+        let array_field = |name: &str| {
+            package
+                .get(name)
+                .and_then(|item| item.as_array())
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut dependencies = Vec::new();
+        for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(table) = manifest.get(kind).and_then(|item| item.as_table()) {
+                dependencies.extend(table.iter().map(|(name, value)| Dependency {
+                    name: name.to_string(),
+                    requirement: value.to_string(),
+                    kind: kind.to_string(),
+                }));
+            }
+        }
+
+        return Ok(Some(CrateMetadata {
+            description: string_field("description"),
+            authors: array_field("authors"),
+            license: string_field("license"),
+            repository: string_field("repository"),
+            homepage: string_field("homepage"),
+            documentation: string_field("documentation"),
+            keywords: array_field("keywords"),
+            categories: array_field("categories"),
+            dependencies,
+        }));
     }
 
-    Ok(None)
+    Ok(Some(CrateMetadata::default()))
 }
 
 /// One crate returned by a search query.
@@ -491,6 +842,10 @@ pub struct SearchResult {
 pub struct SearchResults {
     /// Number of matching crates before the page limit is applied.
     pub total: usize,
+    /// Current 1-based page, clamped to the available range.
+    pub page: usize,
+    /// Number of result pages (at least one, including when there are no matches).
+    pub total_pages: usize,
     /// Crates returned for the requested page.
     pub crates: Vec<SearchResult>,
 }
@@ -500,11 +855,15 @@ fn query_database(
     search_query: Option<&str>,
     display_query: &str,
     per_page: usize,
+    requested_page: usize,
 ) -> Result<SearchResults, SearchError> {
     // Short terms use LIKE because trigram FTS cannot represent them; longer terms use FTS.
     let (where_clause, bind_query) = match search_query {
         Some(_) if display_query.chars().count() < 3 => (
-            "WHERE lower(c.name) LIKE lower(?1) ESCAPE '\\' OR lower(COALESCE(c.description, '')) LIKE lower(?1) ESCAPE '\\'",
+            "WHERE lower(c.name) LIKE lower(?1) ESCAPE '\\'
+                OR lower(COALESCE(c.description, '')) LIKE lower(?1) ESCAPE '\\'
+                OR lower(c.search_keywords) LIKE lower(?1) ESCAPE '\\'
+                OR lower(c.search_categories) LIKE lower(?1) ESCAPE '\\'",
             search_query,
         ),
         Some(_) => (
@@ -523,6 +882,10 @@ fn query_database(
         Some(query) => connection.query_row(&count_sql, [query], |row| row.get(0))?,
         None => connection.query_row(&count_sql, [], |row| row.get(0))?,
     };
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let total_pages = (total / per_page + usize::from(total % per_page != 0)).max(1);
+    let page = requested_page.clamp(1, total_pages);
+    let offset = (page - 1) * per_page;
 
     let query_sql = format!(
         "SELECT c.name, c.description, COALESCE(c.latest_version, '0.0.0')
@@ -532,14 +895,20 @@ fn query_database(
                        WHEN lower(c.name) LIKE lower(?3) THEN 1
                        ELSE 2 END,
                   c.name COLLATE NOCASE
-         LIMIT ?4"
+          LIMIT ?4 OFFSET ?5"
     );
     let name_pattern = like_literal_pattern(display_query);
     // The SQL text contains only fixed clauses; every user value is bound as a parameter.
     let mut statement = connection.prepare(&query_sql)?;
     let mut rows = match bind_query {
-        Some(query) => statement.query(params![query, display_query, name_pattern, per_page])?,
-        None => statement.query(params!["", display_query, name_pattern, per_page])?,
+        Some(query) => statement.query(params![
+            query,
+            display_query,
+            name_pattern,
+            per_page,
+            offset
+        ])?,
+        None => statement.query(params!["", display_query, name_pattern, per_page, offset])?,
     };
     let mut crates = Vec::new();
     while let Some(row) = rows.next()? {
@@ -551,7 +920,9 @@ fn query_database(
     }
 
     Ok(SearchResults {
-        total: usize::try_from(total).unwrap_or(usize::MAX),
+        total,
+        page,
+        total_pages,
         crates,
     })
 }
@@ -615,6 +986,29 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_replaces_a_future_schema() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            "{\"name\":\"foo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+        )
+        .unwrap();
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        let connection = Connection::open(mirror_path.join(DATABASE_FILENAME)).unwrap();
+        connection
+            .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        build(mirror_path).unwrap();
+        assert!(SearchIndex::open(mirror_path).is_ok());
+    }
+
+    #[test]
     fn pagination_reports_total_matches() {
         // Multiple files verify that the directory walk streams each crate independently.
         let temporary_directory = tempfile::tempdir().unwrap();
@@ -633,8 +1027,131 @@ mod tests {
         let index = SearchIndex::open(mirror_path).unwrap();
         let results = index.search("foo", Some(1)).unwrap();
         assert_eq!(results.total, 2);
+        assert_eq!(results.page, 1);
+        assert_eq!(results.total_pages, 2);
         assert_eq!(results.crates.len(), 1);
         assert_eq!(results.crates[0].name, "foo");
+
+        let second_page = index.search_page("foo", Some(1), 2).unwrap();
+        assert_eq!(second_page.page, 2);
+        assert_eq!(second_page.total_pages, 2);
+        assert_eq!(second_page.crates.len(), 1);
+        assert_eq!(second_page.crates[0].name, "food");
+
+        let out_of_range = index.search_page("foo", Some(1), usize::MAX).unwrap();
+        assert_eq!(out_of_range.page, 2);
+        assert_eq!(out_of_range.crates[0].name, "food");
+    }
+
+    #[test]
+    fn reads_crate_details_from_manifest() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        fs::create_dir_all(mirror_path.join("crates/3/f/foo/1.2.0")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            "{\"name\":\"foo\",\"vers\":\"1.2.0\",\"yanked\":false}\n",
+        )
+        .unwrap();
+        write_manifest_archive(
+            mirror_path,
+            "foo",
+            "1.2.0",
+            "[package]\nname = \"foo\"\nversion = \"1.2.0\"\ndescription = \"A useful foo crate.\"\nauthors = [\"A. Author\"]\nlicense = \"MIT\"\nrepository = \"https://example.com/foo\"\nkeywords = [\"example\"]\ncategories = [\"encoding\"]\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        let index = SearchIndex::open(mirror_path).unwrap();
+        let details = index.crate_details("FOO").unwrap().unwrap();
+        assert_eq!(details.name, "foo");
+        assert_eq!(
+            details.metadata.description.as_deref(),
+            Some("A useful foo crate.")
+        );
+        assert_eq!(details.latest_available_version.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            details.available_versions,
+            vec![AvailableVersion {
+                version: "1.2.0".to_string(),
+                yanked: false,
+            }]
+        );
+        assert_eq!(details.metadata.authors, vec!["A. Author"]);
+        assert_eq!(details.metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            details.metadata.repository.as_deref(),
+            Some("https://example.com/foo")
+        );
+        assert_eq!(details.metadata.keywords, vec!["example"]);
+        assert_eq!(details.metadata.categories, vec!["encoding"]);
+        assert_eq!(details.metadata.dependencies.len(), 1);
+        assert_eq!(details.metadata.dependencies[0].name, "serde");
+        assert_eq!(details.metadata.dependencies[0].kind, "dependencies");
+        assert_eq!(index.search("example", None).unwrap().total, 1);
+        assert_eq!(index.search("en", None).unwrap().total, 1);
+        assert_eq!(index.search("MIT", None).unwrap().total, 0);
+        assert_eq!(index.search("Author", None).unwrap().total, 0);
+    }
+
+    #[test]
+    fn uses_newest_available_archive_for_details() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        fs::create_dir_all(mirror_path.join("crates/3/f/foo/1.0.0")).unwrap();
+        fs::create_dir_all(mirror_path.join("crates/3/f/foo/1.5.0")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/f/foo"),
+            concat!(
+                "{\"name\":\"foo\",\"vers\":\"1.0.0\",\"yanked\":false}\n",
+                "{\"name\":\"foo\",\"vers\":\"1.5.0\",\"yanked\":false}\n",
+                "{\"name\":\"foo\",\"vers\":\"2.0.0\",\"yanked\":false}\n"
+            ),
+        )
+        .unwrap();
+        write_crate_archive(mirror_path, "foo", "1.0.0", "Available foo crate.");
+        write_crate_archive(mirror_path, "foo", "1.5.0", "Newer available foo crate.");
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        let index = SearchIndex::open(mirror_path).unwrap();
+        let details = index.crate_details("foo").unwrap().unwrap();
+        assert_eq!(details.max_version, "2.0.0");
+        assert_eq!(details.latest_available_version.as_deref(), Some("1.5.0"));
+        assert_eq!(details.available_versions.len(), 2);
+        assert_eq!(details.available_versions[0].version, "1.5.0");
+        assert_eq!(details.available_versions[1].version, "1.0.0");
+        assert_eq!(
+            details.metadata.description.as_deref(),
+            Some("Newer available foo crate.")
+        );
+    }
+
+    #[test]
+    fn uses_index_dependencies_when_archive_is_missing() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/a")).unwrap();
+        fs::write(
+            mirror_path.join("crates.io-index/3/a/abstract-testing"),
+            concat!(
+                "{\"name\":\"abstract-testing\",\"vers\":\"0.26.1\",\"deps\":[",
+                "{\"name\":\"serde\",\"req\":\"^1.0\",\"kind\":\"normal\"}],",
+                "\"yanked\":false}\n"
+            ),
+        )
+        .unwrap();
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        let index = SearchIndex::open(mirror_path).unwrap();
+        let details = index.crate_details("abstract-testing").unwrap().unwrap();
+        assert!(details.latest_available_version.is_none());
+        assert_eq!(details.available_versions, Vec::new());
+        assert_eq!(details.metadata.dependencies.len(), 1);
+        assert_eq!(details.metadata.dependencies[0].name, "serde");
     }
 
     #[test]
@@ -720,14 +1237,17 @@ mod tests {
     }
 
     fn write_crate_archive(mirror_path: &Path, name: &str, version: &str, description: &str) {
-        // Construct only the manifest needed to verify description extraction.
+        let manifest = format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\ndescription = \"{description}\"\n"
+        );
+        write_manifest_archive(mirror_path, name, version, &manifest);
+    }
+
+    fn write_manifest_archive(mirror_path: &Path, name: &str, version: &str, manifest: &str) {
         let crate_path = get_crate_path(mirror_path, name, version).unwrap();
         let file = File::create(crate_path).unwrap();
         let encoder = GzEncoder::new(file, Compression::default());
         let mut archive = Builder::new(encoder);
-        let manifest = format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\ndescription = \"{description}\"\n"
-        );
         let mut header = tar::Header::new_gnu();
         header
             .set_path(format!("{name}-{version}/Cargo.toml"))
