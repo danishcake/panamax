@@ -37,6 +37,7 @@ walkdir = "2.3"
 toml_edit = {version = "0.14", features = ["easy"] }
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1.10"
 semver = "1.0"
 tar = "0.4"
 

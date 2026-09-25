@@ -7,6 +7,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ pub const DATABASE_FILENAME: &str = "search.db";
 
 /// The database scheme version
 const DATABASE_SCHEMA_VERSION: i32 = 2;
+
+/// Maximum number of crate records to prepare in parallel before writing them.
+const SEARCH_INDEX_BATCH_SIZE: usize = 256;
 
 /// Metadata key containing the crates.io-index Git commit used to build the database.
 const INDEX_GIT_HASH_METADATA_KEY: &str = "index_git_hash";
@@ -424,8 +428,10 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
     // Track the number of crates indexed
     let mut stats = BuildStats::default();
 
-    // Process one index file at a time. The index has one file per crate, so this
-    // keeps memory bounded by the largest individual crate entry and description.
+    // Process index files in bounded batches. Each index file represents one crate,
+    // so the independent parsing and archive reads can be parallelized while keeping
+    // memory bounded. SQLite writes below remain serialized on this connection.
+    let mut paths = Vec::with_capacity(SEARCH_INDEX_BATCH_SIZE);
     for entry in WalkDir::new(&index_path).into_iter().filter_entry(|entry| {
         // Don't iterate into dotfolders
         if entry.file_type().is_dir() {
@@ -440,13 +446,70 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
             continue;
         }
 
-        // Read name, latest version and description
-        let path = entry.into_path();
-        let Some(record) = read_index_file(mirror_path, &path)? else {
+        paths.push(entry.into_path());
+        if paths.len() == SEARCH_INDEX_BATCH_SIZE {
+            stats.crates += process_index_batch(
+                mirror_path,
+                &paths,
+                &transaction,
+                &mut crate_insert,
+                &mut search_insert,
+            )?;
+            paths.clear();
+        }
+    }
+    if !paths.is_empty() {
+        stats.crates += process_index_batch(
+            mirror_path,
+            &paths,
+            &transaction,
+            &mut crate_insert,
+            &mut search_insert,
+        )?;
+    }
+
+    // Drop the prepared statements so that the borrows of transaction finish
+    drop(search_insert);
+    drop(crate_insert);
+
+    // Keep build metadata available for diagnostics without affecting search results.
+    transaction.execute(
+        "INSERT INTO metadata (key, value) VALUES ('generated_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![INDEX_GIT_HASH_METADATA_KEY, index_git_hash],
+    )?;
+    transaction.commit()?;
+
+    Ok(stats)
+}
+
+/// Builds a bounded batch of independent crate records in parallel, then writes them
+/// serially to the search database.
+fn process_index_batch(
+    mirror_path: &Path,
+    paths: &[PathBuf],
+    transaction: &rusqlite::Transaction<'_>,
+    crate_insert: &mut rusqlite::Statement<'_>,
+    search_insert: &mut rusqlite::Statement<'_>,
+) -> Result<usize, SearchError> {
+    // `par_iter` is indexed, so collection retains path order. This keeps database
+    // insertion and error propagation deterministic within each batch.
+    let records = paths
+        .par_iter()
+        .map(|path| read_index_file(mirror_path, path))
+        .collect::<Vec<_>>();
+
+    let mut count = 0;
+    for record in records {
+        let Some(record) = record? else {
             continue;
         };
 
-        // Add to the database
         let details = serde_json::to_string(&record.metadata)?;
         let (keywords, categories) = record.metadata.searchable_fields();
         let available_versions = serde_json::to_string(&record.available_versions)?;
@@ -472,27 +535,10 @@ pub fn build(mirror_path: &Path) -> Result<BuildStats, SearchError> {
             keywords,
             categories,
         ])?;
-        stats.crates += 1;
+        count += 1;
     }
 
-    // Drop the prepared statements so that the borrows of transaction finish
-    drop(search_insert);
-    drop(crate_insert);
-
-    // Keep build metadata available for diagnostics without affecting search results.
-    transaction.execute(
-        "INSERT INTO metadata (key, value) VALUES ('generated_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![INDEX_GIT_HASH_METADATA_KEY, index_git_hash],
-    )?;
-    transaction.commit()?;
-
-    Ok(stats)
+    Ok(count)
 }
 
 /// Returns the commit currently checked out in the local crates.io-index repository.
