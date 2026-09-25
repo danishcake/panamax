@@ -7,6 +7,7 @@ mod crates_index;
 mod download;
 mod mirror;
 mod progress_bar;
+mod readme;
 mod rustup;
 mod search;
 mod serve;

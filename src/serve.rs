@@ -58,6 +58,7 @@ struct SearchTemplate {
 #[template(path = "crate.html")]
 struct CrateTemplate {
     details: CrateDetails,
+    readme_html: Option<std::sync::Arc<str>>,
 }
 
 const STATIC_DIR: Dir = include_dir!("static");
@@ -159,6 +160,7 @@ async fn browser_search(
 async fn browser_crate(
     name: String,
     index: Option<Arc<SearchIndex>>,
+    mirror_path: PathBuf,
 ) -> Result<CrateTemplate, Rejection> {
     let Some(index) = index else {
         return Err(warp::reject::not_found());
@@ -167,7 +169,34 @@ async fn browser_crate(
         .crate_details(&name)
         .map_err(|_| warp::reject::not_found())?
         .ok_or_else(warp::reject::not_found)?;
-    Ok(CrateTemplate { details })
+    let readme_html = if let Some(version) = details.latest_available_version.clone() {
+        let crate_name = details.name.clone();
+        let log_crate_name = crate_name.clone();
+        let log_version = version.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::readme::render_crate_readme(&mirror_path, &crate_name, &version)
+        })
+        .await
+        {
+            Ok(Ok(readme)) => readme,
+            Ok(Err(error)) => {
+                log::warn!("Could not load README for {log_crate_name} {log_version}: {error}");
+                None
+            }
+            Err(error) => {
+                log::warn!(
+                    "README rendering task failed for {log_crate_name} {log_version}: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(CrateTemplate {
+        details,
+        readme_html,
+    })
 }
 
 #[derive(Serialize)]
@@ -242,8 +271,10 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
         .and_then(browser_search);
 
     let crate_page_index = search_index.clone();
+    let crate_page_mirror_path = path.clone();
     let browser_crate_page = warp::path!("crate" / String)
         .and(warp::any().map(move || crate_page_index.clone()))
+        .and(warp::any().map(move || crate_page_mirror_path.clone()))
         .and_then(browser_crate);
 
     // Handle `cargo search` queries ("/crates?q={}&per_page={}")
@@ -626,9 +657,11 @@ mod tests {
                     }],
                 },
             },
+            readme_html: Some(Arc::from("<h2>README content</h2>")),
         };
 
         let rendered = template.render().unwrap();
+        assert!(rendered.contains("<h2>README content</h2>"));
         assert!(rendered.contains("/crates/serde/1.0.0/download"));
         assert!(rendered.contains("MIT OR Apache-2.0"));
         assert!(rendered.contains("href=\"https://github.com/serde-rs/serde\""));

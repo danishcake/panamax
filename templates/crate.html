@@ -81,6 +81,13 @@
             {% endif %}
         </section>
 
+        {% if let Some(readme_html) = readme_html %}
+        <section class="detail-section crate-readme">
+            <h2>README</h2>
+            {{ readme_html|safe }}
+        </section>
+        {% endif %}
+
         {% if !details.metadata.dependencies.is_empty() %}
         <section class="detail-section">
             <h2>Dependencies</h2>

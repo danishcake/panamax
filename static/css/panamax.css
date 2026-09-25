@@ -195,6 +195,29 @@ p:not(#pitch) {
     padding-left: 1.5rem;
 }
 
+.crate-readme {
+    font-size: 0.8em;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.crate-readme img {
+    height: auto;
+    max-width: 100%;
+}
+
+.crate-readme pre {
+    overflow-x: auto;
+    padding: 0.75rem;
+}
+
+.crate-readme table {
+    border-collapse: collapse;
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+}
+
 .dependency-list small {
     color: #999999;
 }
