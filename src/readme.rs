@@ -1,20 +1,24 @@
 use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::HashSet,
     fs::File,
     io::{self, Read},
+    num::NonZeroUsize,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
 
-use ammonia::{Builder, UrlRelative, UrlRelativeEvaluate};
+use ammonia::Builder;
 use flate2::read::GzDecoder;
+use lru::LruCache;
 use tar::Archive;
-use url::Url;
 
 use crate::crates::get_crate_path;
 
+/// The number of rendered READMEs to keep cached
 const README_CACHE_CAPACITY: usize = 100;
+
+/// A set of CSS classes related to rendered code. Given most code will
+/// be Rust, this is probably overkill
 const CODE_CLASSES: &[&str] = &[
     "language-bash",
     "language-c",
@@ -40,49 +44,11 @@ const CODE_CLASSES: &[&str] = &[
     "language-markup",
 ];
 
-#[derive(Default)]
-struct ReadmeCache {
-    rendered: HashMap<PathBuf, Option<Arc<str>>>,
-    recency: VecDeque<PathBuf>,
-}
+type ReadmeCache = Mutex<LruCache<PathBuf, Option<Arc<str>>>>;
 
-impl ReadmeCache {
-    fn get(&mut self, key: &Path) -> Option<Option<Arc<str>>> {
-        let rendered = self.rendered.get(key)?.clone();
-        self.touch(key);
-        Some(rendered)
-    }
-
-    fn insert(&mut self, key: PathBuf, rendered: Option<Arc<str>>) {
-        if self.rendered.contains_key(&key) {
-            self.rendered.insert(key.clone(), rendered);
-            self.touch(&key);
-            return;
-        }
-        self.remove_from_recency(&key);
-        while self.rendered.len() >= README_CACHE_CAPACITY {
-            let Some(oldest) = self.recency.pop_front() else {
-                break;
-            };
-            self.rendered.remove(&oldest);
-        }
-        self.recency.push_back(key.clone());
-        self.rendered.insert(key, rendered);
-    }
-
-    fn touch(&mut self, key: &Path) {
-        self.remove_from_recency(key);
-        self.recency.push_back(key.to_path_buf());
-    }
-
-    fn remove_from_recency(&mut self, key: &Path) {
-        if let Some(position) = self.recency.iter().position(|entry| entry == key) {
-            self.recency.remove(position);
-        }
-    }
-}
-
-static README_CACHE: OnceLock<Mutex<ReadmeCache>> = OnceLock::new();
+/// The cache of previously rendered READMEs
+static README_CACHE: OnceLock<ReadmeCache> = OnceLock::new();
+static SYNTECT_ADAPTER: OnceLock<comrak::plugins::syntect::SyntectAdapter> = OnceLock::new();
 
 /// Read and render the README from a local crate archive, caching the latest 100 results.
 pub fn render_crate_readme(
@@ -90,76 +56,82 @@ pub fn render_crate_readme(
     crate_name: &str,
     version: &str,
 ) -> io::Result<Option<Arc<str>>> {
+    // Determine path to the crate
     let archive_path = get_crate_path(mirror_path, crate_name, version)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
 
+    // Return the cached rendering if possible
     if let Some(rendered) = cache_get(&archive_path) {
         return Ok(rendered);
     }
 
-    let rendered = read_archive_readme(&archive_path, crate_name, version)?.map(|readme| {
-        Arc::<str>::from(render_markdown(
-            &readme.contents,
-            &readme.path,
-            readme.repository.as_deref(),
-        ))
-    });
+    // Otherwise render and put into the cache
+    let rendered = read_archive_readme(&archive_path, crate_name, version)?
+        .map(|readme| Arc::<str>::from(render_markdown(&readme)));
     cache_insert(archive_path, rendered.clone());
     Ok(rendered)
 }
 
 fn cache_get(key: &Path) -> Option<Option<Arc<str>>> {
-    let cache = README_CACHE.get_or_init(|| Mutex::new(ReadmeCache::default()));
-    cache.lock().ok()?.get(key)
+    let cache = readme_cache();
+    cache.lock().ok()?.get(key).cloned()
 }
 
 fn cache_insert(key: PathBuf, rendered: Option<Arc<str>>) {
-    let cache = README_CACHE.get_or_init(|| Mutex::new(ReadmeCache::default()));
+    let cache = readme_cache();
     if let Ok(mut cache) = cache.lock() {
-        cache.insert(key, rendered);
+        cache.put(key, rendered);
     }
 }
 
-struct CrateReadme {
-    path: PathBuf,
-    contents: String,
-    repository: Option<String>,
+/// Gets the cache. If it hasn't been initialized, initializes it first
+fn readme_cache() -> &'static ReadmeCache {
+    README_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(README_CACHE_CAPACITY)
+                .expect("README cache capacity must be nonzero"),
+        ))
+    })
 }
 
+/// Where the Cargo.toml indicates that a README should be located
 enum ReadmeLocation {
+    /// An explicit path is used if the [package] or [project] readme key contains a string
     Explicit(PathBuf),
+    /// The default path is used if not readme key is present, or is set to true
     Default,
-    Disabled,
+    /// No readme is present if the readme key is set to fals
+    NotPresent,
 }
 
-struct ReadmeManifest {
-    location: ReadmeLocation,
-    repository: Option<String>,
-}
-
+/// Read the README for a given crate. This requires reading Cargo.toml first, the following the
+/// readme entry.
 fn read_archive_readme(
     archive_path: &Path,
     crate_name: &str,
     version: &str,
-) -> io::Result<Option<CrateReadme>> {
+) -> io::Result<Option<String>> {
     let root = PathBuf::from(format!("{crate_name}-{version}"));
-    let Some(manifest) = read_archive_file(archive_path, &root.join("Cargo.toml"))? else {
+    let Some(manifest) = read_archive_file_as_string(archive_path, &root.join("Cargo.toml"))?
+    else {
         return Ok(None);
     };
-    let manifest = readme_manifest(&manifest)?;
-    if matches!(&manifest.location, ReadmeLocation::Disabled) {
+
+    // Determine the README file from Cargo.toml
+    let readme_location = determine_readme_location(&manifest)?;
+    if matches!(&readme_location, ReadmeLocation::NotPresent) {
         return Ok(None);
     }
 
-    let Some(mut archive) = open_archive(archive_path)? else {
-        return Ok(None);
-    };
-    let explicit_path = match &manifest.location {
+    // Open the crate so we can iterate through the entries
+    let mut archive = open_archive(archive_path)?;
+    let explicit_path = match &readme_location {
         ReadmeLocation::Explicit(path) => Some(root.join(path)),
-        ReadmeLocation::Default | ReadmeLocation::Disabled => None,
+        ReadmeLocation::Default | ReadmeLocation::NotPresent => None,
     };
     let mut best_default = None;
 
+    // Iterate through the entries, and find the best README
     for entry in archive.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
@@ -167,22 +139,20 @@ fn read_archive_readme(
         }
         let entry_path = entry.path()?.into_owned();
 
+        // An exact match on the explicit path is an automatic best match
         if let Some(expected_path) = explicit_path.as_ref() {
             if &entry_path == expected_path {
                 let mut contents = String::new();
                 entry.read_to_string(&mut contents)?;
-                return Ok(Some(CrateReadme {
-                    path: match &manifest.location {
-                        ReadmeLocation::Explicit(path) => path.clone(),
-                        ReadmeLocation::Default | ReadmeLocation::Disabled => unreachable!(),
-                    },
-                    contents,
-                    repository: manifest.repository.clone(),
-                }));
+                return Ok(Some(contents));
             }
+
+            // If there is an explicit path, only accept exact matches
             continue;
         }
 
+        // Manipulate the entry path by stripping the root, checking that the resulting entry is not nested,
+        // mapping the filename to a Rust string and determining the 'rank' of the readme
         let Ok(relative_path) = entry_path.strip_prefix(&root) else {
             continue;
         };
@@ -195,43 +165,42 @@ fn read_archive_readme(
         let Some(rank) = default_readme_rank(filename) else {
             continue;
         };
+
+        // Read the README. If it's best option return early
+        // Otherwise store if it's a higher rank
         let mut contents = String::new();
         entry.read_to_string(&mut contents)?;
         if rank == 0 {
-            return Ok(Some(CrateReadme {
-                path: relative_path.to_path_buf(),
-                contents,
-                repository: manifest.repository.clone(),
-            }));
+            return Ok(Some( contents ));
         }
         if best_default
             .as_ref()
-            .map(|(best_rank, _, _)| rank < *best_rank)
+            .map(|(best_rank, _)| rank < *best_rank)
             .unwrap_or(true)
         {
-            best_default = Some((rank, relative_path.to_path_buf(), contents));
+            best_default = Some((rank, contents));
         }
     }
 
-    Ok(best_default.map(|(_, path, contents)| CrateReadme {
-        path,
-        contents,
-        repository: manifest.repository,
-    }))
+    Ok(best_default.map(|(_, contents)| contents ))
 }
 
-fn open_archive(archive_path: &Path) -> io::Result<Option<Archive<GzDecoder<File>>>> {
+/// Opens the archive and returns an iterable Archive on success
+fn open_archive(archive_path: &Path) -> io::Result<Archive<GzDecoder<File>>> {
     match File::open(archive_path) {
-        Ok(file) => Ok(Some(Archive::new(GzDecoder::new(file)))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(file) => Ok(Archive::new(GzDecoder::new(file))),
         Err(error) => Err(error),
     }
 }
 
-fn read_archive_file(archive_path: &Path, target_path: &Path) -> io::Result<Option<String>> {
-    let Some(mut archive) = open_archive(archive_path)? else {
-        return Ok(None);
-    };
+/// Reads a file from the archive
+/// If not found, Ok(None) is returned
+fn read_archive_file_as_string(
+    archive_path: &Path,
+    target_path: &Path,
+) -> io::Result<Option<String>> {
+    let mut archive = open_archive(archive_path)?;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         if entry.header().entry_type().is_file() && entry.path()?.as_ref() == target_path {
@@ -243,40 +212,42 @@ fn read_archive_file(archive_path: &Path, target_path: &Path) -> io::Result<Opti
     Ok(None)
 }
 
-fn readme_manifest(manifest: &str) -> io::Result<ReadmeManifest> {
+/// Given a Cargo.toml, determine the path to the readme
+fn determine_readme_location(manifest: &str) -> io::Result<ReadmeLocation> {
+    // Parse the toml
     let manifest = manifest
         .parse::<toml_edit::Document>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+
+    // Find the 'package' key, or the older 'project' key
     let Some(package) = manifest
         .get("package")
         .or_else(|| manifest.get("project"))
         .and_then(|item| item.as_table())
     else {
-        return Ok(ReadmeManifest {
-            location: ReadmeLocation::Disabled,
-            repository: None,
-        });
+        // If neither is present then the package is malformed - this should be vanishing rare
+        // and/or impossible, as crates.io would reject a malformed package
+        return Ok(ReadmeLocation::NotPresent);
     };
 
+    // The readme key can be a bool, whereupon true indicates README.md
+    // and false disables the readme.
+    // If not present, the default location is used
     let location = match package.get("readme") {
-        Some(readme) if readme.as_bool() == Some(false) => ReadmeLocation::Disabled,
+        Some(readme) if readme.as_bool() == Some(false) => ReadmeLocation::NotPresent,
         Some(readme) if readme.as_str().is_some() => {
             normalize_readme_path(Path::new(readme.as_str().unwrap()))
                 .map(ReadmeLocation::Explicit)
-                .unwrap_or(ReadmeLocation::Disabled)
+                .unwrap_or(ReadmeLocation::NotPresent)
         }
         _ => ReadmeLocation::Default,
     };
-    let repository = package
-        .get("repository")
-        .and_then(|item| item.as_str())
-        .map(str::to_owned);
-    Ok(ReadmeManifest {
-        location,
-        repository,
-    })
+    Ok(location)
 }
 
+/// Transforms the readme path into a standard form.
+/// Any '.' part is skipped
+/// Any '..' part is considered an error, and results in None
 fn normalize_readme_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -286,9 +257,11 @@ fn normalize_readme_path(path: &Path) -> Option<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
     }
+    // An empty result is transformed to None
     (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
+/// If a non-explicit README is present, prioritise the one with the lowest rank
 fn default_readme_rank(filename: &str) -> Option<usize> {
     match filename.to_ascii_lowercase().as_str() {
         "readme.md" => Some(0),
@@ -299,7 +272,7 @@ fn default_readme_rank(filename: &str) -> Option<usize> {
     }
 }
 
-fn render_markdown(markdown: &str, readme_path: &Path, repository: Option<&str>) -> String {
+fn render_markdown(markdown: &str) -> String {
     let mut options = comrak::Options::default();
     options.extension.alerts = true;
     options.extension.autolink = true;
@@ -309,16 +282,24 @@ fn render_markdown(markdown: &str, readme_path: &Path, repository: Option<&str>)
     options.extension.table = true;
     options.extension.tasklist = true;
     options.extension.footnotes = true;
+    options.extension.shortcodes = true;
     options.extension.header_id_prefix = Some("user-content-".to_string());
     options.extension.header_id_prefix_in_href = true;
     options.render.r#unsafe = true;
-    let html = comrak::markdown_to_html(markdown, &options);
+    let adapter = SYNTECT_ADAPTER.get_or_init(|| {
+        comrak::plugins::syntect::SyntectAdapterBuilder::new()
+            .theme("base16-ocean.dark")
+            .build()
+    });
+    let mut plugins = comrak::options::Plugins::default();
+    plugins.render.codefence_syntax_highlighter = Some(adapter);
+    let html = comrak::markdown_to_html_with_plugins(markdown, &options, &plugins);
 
     let mut sanitizer = Builder::default();
     sanitizer
         .add_tags(&["input", "ol", "picture", "section", "source"])
         .link_rel(Some("nofollow noopener noreferrer"))
-        .add_generic_attributes(&["align"])
+        .add_generic_attributes(&["align", "style"])
         .add_tag_attributes("a", &["aria-label", "id", "target"])
         .add_tag_attributes("h1", &["id"])
         .add_tag_attributes("h2", &["id"])
@@ -342,106 +323,15 @@ fn render_markdown(markdown: &str, readme_path: &Path, repository: Option<&str>)
             ],
         )
         .add_allowed_classes("p", &["markdown-alert-title"])
+        .filter_style_properties(
+            ["color", "background-color"]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        )
         .id_prefix(Some("user-content-"));
     sanitizer.add_allowed_classes("code", CODE_CLASSES);
 
-    let relative_urls = repository
-        .and_then(repository_base_url)
-        .map(|base_url| {
-            UrlRelative::Custom(Box::new(ReadmeUrlResolver {
-                base_url,
-                base_dir: readme_path
-                    .parent()
-                    .and_then(Path::to_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            }))
-        })
-        .unwrap_or(UrlRelative::Deny);
-    sanitizer.url_relative(relative_urls);
     sanitizer.clean(&html).to_string()
-}
-
-fn repository_base_url(repository: &str) -> Option<String> {
-    let mut url = Url::parse(repository).ok()?;
-    if !matches!(
-        url.host_str()?,
-        "github.com" | "gitlab.com" | "bitbucket.org"
-    ) {
-        return None;
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    let mut path = url.path().trim_end_matches('/').to_owned();
-    if path.ends_with(".git") {
-        path.truncate(path.len() - 4);
-    }
-    url.set_path(&format!("{path}/"));
-    Some(url.into())
-}
-
-struct ReadmeUrlResolver {
-    base_url: String,
-    base_dir: String,
-}
-
-impl UrlRelativeEvaluate<'_> for ReadmeUrlResolver {
-    fn evaluate<'url>(&self, url: &'url str) -> Option<Cow<'url, str>> {
-        if url.starts_with('#') {
-            return Some(Cow::Borrowed(url));
-        }
-        if url.starts_with("::") {
-            return None;
-        }
-
-        let url_path = url.split(['?', '#']).next().unwrap_or(url);
-        let extension = Path::new(url_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
-        let is_media = matches!(
-            extension.as_deref(),
-            Some("svg" | "png" | "jpg" | "jpeg" | "gif" | "mp4" | "webm" | "ogg" | "webp")
-        );
-        let mut resolved = self.base_url.clone();
-        resolved.push_str(if is_media { "raw/HEAD" } else { "blob/HEAD" });
-
-        let mut path = String::new();
-        if !self.base_dir.is_empty() {
-            path.push_str(&self.base_dir);
-            path.push('/');
-        }
-        path.push_str(url.strip_prefix('/').unwrap_or(url));
-        let (path, suffix) = match path.find(['?', '#']) {
-            Some(index) => path.split_at(index),
-            None => (path.as_str(), ""),
-        };
-        resolved.push('/');
-        resolved.push_str(&normalize_path(path));
-        resolved.push_str(suffix);
-
-        if is_media && extension.as_deref() == Some("svg") {
-            if let Ok(mut parsed_url) = Url::parse(&resolved) {
-                parsed_url.query_pairs_mut().append_pair("sanitize", "true");
-                resolved = parsed_url.into();
-            }
-        }
-        Some(Cow::Owned(resolved))
-    }
-}
-
-fn normalize_path(path: &str) -> String {
-    let mut segments = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "." => {}
-            ".." => {
-                segments.pop();
-            }
-            segment => segments.push(segment),
-        }
-    }
-    segments.join("/")
 }
 
 #[cfg(test)]
@@ -465,11 +355,11 @@ mod tests {
             &[
                 (
                     "Cargo.toml",
-                    "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nreadme = \"docs/INTRO.md\"\nrepository = \"https://github.com/example/foo.git\"\n",
+                    "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nreadme = \"docs/INTRO.md\"\nrepository = \"https://codeberg.org/example/foo.git\"\n",
                 ),
                 (
                     "docs/INTRO.md",
-                    "# Hello\n\n**World**\n\n[Guide](guide.md) ![Logo](logo.png)\n\n<script>alert('unsafe')</script>",
+                    "# Hello\n\n**World** :balloon:\n\n[Guide](guide.md) ![Logo](logo.png)\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>",
                 ),
             ],
         );
@@ -478,10 +368,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rendered.contains("<strong>World</strong>"));
+        assert!(rendered.contains("🎈"));
         assert!(
-            rendered.contains("href=\"https://github.com/example/foo/blob/HEAD/docs/guide.md\"")
+            rendered.contains("href=\"https://codeberg.org/example/foo/blob/HEAD/docs/guide.md\"")
         );
-        assert!(rendered.contains("src=\"https://github.com/example/foo/raw/HEAD/docs/logo.png\""));
+        assert!(
+            rendered.contains("src=\"https://codeberg.org/example/foo/raw/HEAD/docs/logo.png\"")
+        );
+        assert!(rendered.contains("style=\"color:"));
         assert!(!rendered.contains("<script>"));
         assert!(!rendered.contains("unsafe"));
     }
@@ -511,19 +405,20 @@ mod tests {
 
     #[test]
     fn readme_cache_keeps_the_100_most_recent_entries() {
-        let mut cache = ReadmeCache::default();
+        let mut cache: LruCache<PathBuf, Option<Arc<str>>> =
+            LruCache::new(NonZeroUsize::new(README_CACHE_CAPACITY).unwrap());
         for index in 0..README_CACHE_CAPACITY {
-            cache.insert(
+            cache.put(
                 PathBuf::from(format!("crate-{index}")),
                 Some(Arc::from(format!("rendered-{index}"))),
             );
         }
         assert!(cache.get(Path::new("crate-0")).is_some());
-        cache.insert(PathBuf::from("crate-100"), Some(Arc::from("rendered-100")));
+        cache.put(PathBuf::from("crate-100"), Some(Arc::from("rendered-100")));
 
         assert!(cache.get(Path::new("crate-0")).is_some());
         assert!(cache.get(Path::new("crate-1")).is_none());
-        assert_eq!(cache.rendered.len(), README_CACHE_CAPACITY);
+        assert_eq!(cache.len(), README_CACHE_CAPACITY);
     }
 
     fn write_crate_archive(mirror_path: &Path, name: &str, version: &str, files: &[(&str, &str)]) {

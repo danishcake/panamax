@@ -207,6 +207,7 @@ p:not(#pitch) {
 }
 
 .crate-readme pre {
+    font-size: 0.8em;
     overflow-x: auto;
     padding: 0.75rem;
 }

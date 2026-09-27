@@ -92,10 +92,12 @@ async fn search(
         return Err(warp::reject::not_found());
     };
 
+    // Search the database
     let results = index
         .search(&p.q, p.per_page)
         .map_err(|_| warp::reject::not_found())?;
-    // Convert the internal result type to Cargo's registry search response shape.
+
+    // Convert to Cargo's registry search response structure
     let crates = results
         .crates
         .into_iter()
@@ -116,12 +118,17 @@ async fn search(
         .map_err(|_| warp::reject::not_found())
 }
 
+/// Show details about an in-browser search
 async fn browser_search(
     params: BrowserSearch,
     index: Option<Arc<SearchIndex>>,
 ) -> Result<SearchTemplate, Rejection> {
+    // Extract the query string and page
     let query = params.q.unwrap_or_default().trim().to_string();
     let requested_page = params.page.unwrap_or(1);
+
+    // Crates data is unavailable until the explicit offline build command has created the database.
+    // If this hasn't been done we'll just render a basic empty result
     let Some(index) = index else {
         return Ok(SearchTemplate {
             query,
@@ -133,6 +140,7 @@ async fn browser_search(
         });
     };
 
+    // If the query hasn't been specified we'll just show the search box
     if query.is_empty() {
         return Ok(SearchTemplate {
             query,
@@ -144,6 +152,7 @@ async fn browser_search(
         });
     }
 
+    // Search the database
     let results = index
         .search_page(&query, Some(BROWSER_SEARCH_PER_PAGE), requested_page)
         .map_err(|_| warp::reject::not_found())?;
@@ -157,18 +166,24 @@ async fn browser_search(
     })
 }
 
-async fn browser_crate(
+/// Shows details about a single crate
+async fn crate_details(
     name: String,
     index: Option<Arc<SearchIndex>>,
     mirror_path: PathBuf,
 ) -> Result<CrateTemplate, Rejection> {
+    // Crate details are unavailable until the explicit offline build command has created the database.
     let Some(index) = index else {
         return Err(warp::reject::not_found());
     };
+
+    // Search the database
     let details = index
         .crate_details(&name)
         .map_err(|_| warp::reject::not_found())?
         .ok_or_else(warp::reject::not_found)?;
+
+    // Render the crate README to a snippet of HTML
     let readme_html = if let Some(version) = details.latest_available_version.clone() {
         let crate_name = details.name.clone();
         let log_crate_name = crate_name.clone();
@@ -275,7 +290,7 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     let browser_crate_page = warp::path!("crate" / String)
         .and(warp::any().map(move || crate_page_index.clone()))
         .and(warp::any().map(move || crate_page_mirror_path.clone()))
-        .and_then(browser_crate);
+        .and_then(crate_details);
 
     // Handle `cargo search` queries ("/crates?q={}&per_page={}")
     let search_index_for_route = search_index.clone();
