@@ -37,6 +37,8 @@ tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 futures = "0.3"
 walkdir = "2.3"
+mime_guess = "2"
+percent-encoding = "2"
 toml_edit = {version = "0.14", features = ["easy"] }
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }

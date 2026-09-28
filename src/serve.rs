@@ -4,6 +4,7 @@ use askama::Template;
 use bytes::BytesMut;
 use futures_util::stream::TryStreamExt;
 use include_dir::{include_dir, Dir};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -59,6 +60,22 @@ struct SearchTemplate {
 struct CrateTemplate {
     details: CrateDetails,
     readme_html: Option<std::sync::Arc<str>>,
+}
+
+#[derive(Template)]
+#[template(path = "crate_source.html")]
+struct CrateSourceTemplate {
+    crate_name: String,
+    version: String,
+    crate_url: String,
+    parent_url: Option<String>,
+    entries: Vec<CrateSourceEntry>,
+}
+
+struct CrateSourceEntry {
+    name: String,
+    url: String,
+    is_directory: bool,
 }
 
 const STATIC_DIR: Dir = include_dir!("static");
@@ -292,6 +309,19 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
         .and(warp::any().map(move || crate_page_mirror_path.clone()))
         .and_then(crate_details);
 
+    // Serve paths referenced by crate READMEs from the corresponding local archive.
+    let crate_source_mirror_path = path.clone();
+    let crate_source_file = warp::path("crate")
+        .and(warp::path::param::<String>())
+        .and(warp::path::param::<String>())
+        .and(warp::path("source"))
+        .and(warp::path::tail())
+        .and(warp::get())
+        .and_then(move |name: String, version: String, file_path: Tail| {
+            let mirror_path = crate_source_mirror_path.clone();
+            async move { crate_source_file_response(mirror_path, name, version, file_path).await }
+        });
+
     // Handle `cargo search` queries ("/crates?q={}&per_page={}")
     let search_index_for_route = search_index.clone();
     let crates_search = warp::path::path("crates")
@@ -405,6 +435,7 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
 
     let routes = index
         .or(browser_search_page)
+        .or(crate_source_file)
         .or(browser_crate_page)
         .or(static_dir)
         .or(dist_dir)
@@ -433,6 +464,164 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
             warp::serve(routes).run(socket_addr).await;
         }
     }
+}
+
+async fn crate_source_file_response(
+    mirror_path: PathBuf,
+    crate_name: String,
+    version: String,
+    file_path: Tail,
+) -> Result<http::Response<Vec<u8>>, Rejection> {
+    let decoded_path = percent_decode_str(file_path.as_str())
+        .decode_utf8()
+        .map_err(|_| warp::reject::not_found())?;
+    let relative_path = PathBuf::from(decoded_path.as_ref());
+    let contents = if relative_path.as_os_str().is_empty() {
+        None
+    } else {
+        let read_path = relative_path.clone();
+        let file_mirror_path = mirror_path.clone();
+        let file_crate_name = crate_name.clone();
+        let file_version = version.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                crate::readme::read_crate_file(
+                    &file_mirror_path,
+                    &file_crate_name,
+                    &file_version,
+                    &read_path,
+                )
+            })
+            .await
+            .map_err(|_| warp::reject::not_found())?
+            .map_err(|_| warp::reject::not_found())?,
+        )
+    };
+
+    if let Some(Some(contents)) = contents {
+        let content_type = crate_file_content_type(&relative_path);
+        return source_response(contents, &content_type);
+    }
+
+    let listing_mirror_path = mirror_path.clone();
+    let listing_crate_name = crate_name.clone();
+    let listing_version = version.clone();
+    let listing_path = relative_path.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        crate::readme::list_crate_directory(
+            &listing_mirror_path,
+            &listing_crate_name,
+            &listing_version,
+            &listing_path,
+        )
+    })
+    .await
+    .map_err(|_| warp::reject::not_found())?
+    .map_err(|_| warp::reject::not_found())?
+    .ok_or_else(warp::reject::not_found)?;
+
+    let listing = render_crate_directory_listing(&crate_name, &version, &relative_path, &entries)?;
+    source_response(listing.into_bytes(), "text/html; charset=utf-8")
+}
+
+fn source_response(
+    body: Vec<u8>,
+    content_type: &str,
+) -> Result<http::Response<Vec<u8>>, Rejection> {
+    let mut response = http::Response::builder()
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header("X-Content-Type-Options", "nosniff");
+    if is_document_content_type(content_type) {
+        response = response.header(
+            "Content-Security-Policy",
+            "sandbox allow-downloads allow-top-navigation-by-user-activation",
+        );
+    }
+    response
+        .body(body)
+        .map_err(|error| warp::reject::custom(ServeError::from(error)))
+}
+
+fn crate_file_content_type(path: &std::path::Path) -> String {
+    let content_type = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_owned();
+    if content_type == "application/x-sh" {
+        "text/plain; charset=utf-8".to_owned()
+    } else {
+        content_type
+    }
+}
+
+fn is_document_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type.split(';').next().map(str::trim),
+        Some("text/html" | "application/xhtml+xml" | "image/svg+xml")
+    )
+}
+
+fn render_crate_directory_listing(
+    crate_name: &str,
+    version: &str,
+    path: &std::path::Path,
+    entries: &[crate::readme::CrateDirectoryEntry],
+) -> Result<String, Rejection> {
+    let entries = entries
+        .iter()
+        .map(|entry| {
+            let entry_path = path.join(&entry.name);
+            let encoded_path = encode_archive_path(&entry_path);
+            CrateSourceEntry {
+                name: entry.name.clone(),
+                url: format!(
+                    "/crate/{crate_name}/{version}/source/{encoded_path}{}",
+                    if entry.is_directory { "/" } else { "" }
+                ),
+                is_directory: entry.is_directory,
+            }
+        })
+        .collect();
+    CrateSourceTemplate {
+        crate_name: crate_name.to_owned(),
+        version: version.to_owned(),
+        crate_url: format!("/crate/{crate_name}"),
+        parent_url: (!path.as_os_str().is_empty()).then(|| {
+            let parent_path = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let encoded_parent = encode_archive_path(parent_path);
+            if encoded_parent.is_empty() {
+                format!("/crate/{crate_name}/{version}/source/")
+            } else {
+                format!("/crate/{crate_name}/{version}/source/{encoded_parent}/")
+            }
+        }),
+        entries,
+    }
+    .render()
+    .map_err(|error| warp::reject::custom(ServeError::Other(error.to_string())))
+}
+
+fn encode_archive_path(path: &std::path::Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .map(encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::new();
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Get all rustup platforms available on the mirror.
@@ -686,6 +875,70 @@ mod tests {
         assert!(!rendered.contains("href=\"data:text/html,unsafe\""));
         assert!(rendered.contains("href=\"/crate/serde_derive\""));
         assert!(rendered.contains("serde_derive"));
+        assert!(rendered.contains("href=\"/crate/serde/1.0.0/source/\">Browse contents</a>"));
+        assert!(rendered.find("README</h2>").unwrap() < rendered.find("Versions</h2>").unwrap());
+    }
+
+    #[test]
+    fn crate_source_listing_escapes_names_and_encodes_links() {
+        let rendered = render_crate_directory_listing(
+            "foo",
+            "1.0.0",
+            std::path::Path::new("examples"),
+            &[crate::readme::CrateDirectoryEntry {
+                name: "demo <one>.rs".to_owned(),
+                is_directory: false,
+            }],
+        )
+        .unwrap();
+
+        assert!(rendered.contains("class=\"browser-content crate-page-content\""));
+        assert!(rendered.contains("class=\"detail-section crate-source-listing\""));
+        assert!(rendered.contains(
+            "href=\"/crate/foo/1.0.0/source/examples/demo%20%3Cone%3E.rs\">demo &lt;one&gt;.rs</a>"
+        ));
+        assert!(rendered.contains("href=\"/crate/foo/1.0.0/source/\">..</a>"));
+        assert!(!rendered.contains("demo <one>.rs</a>"));
+
+        let root_listing =
+            render_crate_directory_listing("foo", "1.0.0", std::path::Path::new(""), &[]).unwrap();
+        assert!(!root_listing.contains(">..</a>"));
+    }
+
+    #[test]
+    fn shell_scripts_are_renderable_and_non_documents_are_not_sandboxed() {
+        assert_eq!(
+            crate_file_content_type(std::path::Path::new("install-build-tools.sh")),
+            "text/plain; charset=utf-8"
+        );
+
+        let shell_response = source_response(
+            b"#!/bin/sh\necho hello".to_vec(),
+            "text/plain; charset=utf-8",
+        )
+        .unwrap();
+        assert_eq!(
+            shell_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(shell_response
+            .headers()
+            .get("Content-Security-Policy")
+            .is_none());
+        assert_eq!(shell_response.body(), b"#!/bin/sh\necho hello");
+
+        let html_response =
+            source_response(b"<p>contents</p>".to_vec(), "text/html; charset=utf-8").unwrap();
+        assert_eq!(
+            html_response
+                .headers()
+                .get("Content-Security-Policy")
+                .unwrap(),
+            "sandbox allow-downloads allow-top-navigation-by-user-activation"
+        );
     }
 
     #[tokio::test]

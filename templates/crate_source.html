@@ -1,0 +1,26 @@
+<head>
+    <meta charset="utf-8">
+    <title>{{ crate_name }} files - Panamax</title>
+    <link rel="stylesheet" href="/static/css/normalize.css">
+    <link rel="stylesheet" href="/static/css/rustup.css">
+    <link rel="stylesheet" href="/static/css/panamax.css">
+</head>
+
+<body class="browser-page">
+    <main class="browser-content crate-page-content">
+        <p class="page-kicker"><a href="/">Panamax</a> / <a href="{{ crate_url }}">{{ crate_name }}</a> / files</p>
+        <h1>{{ crate_name }} files</h1>
+        <p class="muted">Version {{ version }}</p>
+        <section class="detail-section crate-source-listing">
+            <h2>Contents</h2>
+            <ul class="crate-results crate-source-list">
+                {% if let Some(parent_url) = parent_url %}
+                <li class="crate-result"><a href="{{ parent_url }}">..</a></li>
+                {% endif %}
+                {% for entry in entries %}
+                <li class="crate-result"><a href="{{ entry.url }}">{{ entry.name }}{% if entry.is_directory %}/{% endif %}</a></li>
+                {% endfor %}
+            </ul>
+        </section>
+    </main>
+</body>

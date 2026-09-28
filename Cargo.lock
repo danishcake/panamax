@@ -1478,6 +1478,8 @@ dependencies = [
  "indicatif",
  "log",
  "lru",
+ "mime_guess",
+ "percent-encoding",
  "rayon",
  "reqwest",
  "rusqlite",

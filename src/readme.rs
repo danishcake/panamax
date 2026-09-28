@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::{self, Read},
     num::NonZeroUsize,
@@ -11,6 +11,7 @@ use ammonia::Builder;
 use flate2::read::GzDecoder;
 use lru::LruCache;
 use tar::Archive;
+use url::{Host, Url};
 
 use crate::crates::get_crate_path;
 
@@ -66,8 +67,14 @@ pub fn render_crate_readme(
     }
 
     // Otherwise render and put into the cache
-    let rendered = read_archive_readme(&archive_path, crate_name, version)?
-        .map(|readme| Arc::<str>::from(render_markdown(&readme)));
+    let rendered = read_archive_readme(&archive_path, crate_name, version)?.map(|readme| {
+        Arc::<str>::from(render_markdown(
+            &readme.contents,
+            crate_name,
+            version,
+            &readme.path,
+        ))
+    });
     cache_insert(archive_path, rendered.clone());
     Ok(rendered)
 }
@@ -104,13 +111,21 @@ enum ReadmeLocation {
     NotPresent,
 }
 
+/// A README and its location within a crate archive.
+struct ArchiveReadme {
+    /// The README path relative to the crate archive root.
+    path: PathBuf,
+    /// The README's Markdown contents.
+    contents: String,
+}
+
 /// Read the README for a given crate. This requires reading Cargo.toml first, the following the
 /// readme entry.
 fn read_archive_readme(
     archive_path: &Path,
     crate_name: &str,
     version: &str,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<ArchiveReadme>> {
     let root = PathBuf::from(format!("{crate_name}-{version}"));
     let Some(manifest) = read_archive_file_as_string(archive_path, &root.join("Cargo.toml"))?
     else {
@@ -144,7 +159,14 @@ fn read_archive_readme(
             if &entry_path == expected_path {
                 let mut contents = String::new();
                 entry.read_to_string(&mut contents)?;
-                return Ok(Some(contents));
+                let relative_path = entry_path
+                    .strip_prefix(&root)
+                    .expect("explicit README path is under the crate root")
+                    .to_path_buf();
+                return Ok(Some(ArchiveReadme {
+                    path: relative_path,
+                    contents,
+                }));
             }
 
             // If there is an explicit path, only accept exact matches
@@ -171,18 +193,140 @@ fn read_archive_readme(
         let mut contents = String::new();
         entry.read_to_string(&mut contents)?;
         if rank == 0 {
-            return Ok(Some( contents ));
+            return Ok(Some(ArchiveReadme {
+                path: relative_path.to_path_buf(),
+                contents,
+            }));
         }
         if best_default
             .as_ref()
             .map(|(best_rank, _)| rank < *best_rank)
             .unwrap_or(true)
         {
-            best_default = Some((rank, contents));
+            best_default = Some((
+                rank,
+                ArchiveReadme {
+                    path: relative_path.to_path_buf(),
+                    contents,
+                },
+            ));
         }
     }
 
-    Ok(best_default.map(|(_, contents)| contents ))
+    Ok(best_default.map(|(_, readme)| readme))
+}
+
+/// Read a file from a crate archive using a path relative to the crate root.
+pub(crate) fn read_crate_file(
+    mirror_path: &Path,
+    crate_name: &str,
+    version: &str,
+    relative_path: &Path,
+) -> io::Result<Option<Vec<u8>>> {
+    if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid crate name or version",
+        ));
+    }
+    let relative_path = normalize_readme_path(relative_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate archive path"))?;
+    let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
+    let target_path = PathBuf::from(format!("{crate_name}-{version}")).join(relative_path);
+    let mut archive = open_archive(&archive_path)?;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type().is_file() && entry.path()?.as_ref() == target_path.as_path()
+        {
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)?;
+            return Ok(Some(contents));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CrateDirectoryEntry {
+    pub name: String,
+    pub is_directory: bool,
+}
+
+/// List the direct children of a directory in a crate archive.
+pub(crate) fn list_crate_directory(
+    mirror_path: &Path,
+    crate_name: &str,
+    version: &str,
+    relative_path: &Path,
+) -> io::Result<Option<Vec<CrateDirectoryEntry>>> {
+    if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid crate name or version",
+        ));
+    }
+    let relative_path = if relative_path.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        normalize_readme_path(relative_path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid crate archive path")
+        })?
+    };
+    let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
+    let archive_root = PathBuf::from(format!("{crate_name}-{version}"));
+    let target_path = archive_root.join(&relative_path);
+    let mut archive = open_archive(&archive_path)?;
+    let mut found_directory = relative_path.as_os_str().is_empty();
+    let mut children = BTreeMap::<String, bool>::new();
+
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let entry_path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            continue;
+        }
+        let is_directory = entry_type.is_dir();
+        if entry_path == target_path {
+            found_directory |= is_directory;
+            continue;
+        }
+        let Ok(descendant) = entry_path.strip_prefix(&target_path) else {
+            continue;
+        };
+        let mut components = descendant.components();
+        let Some(Component::Normal(child_name)) = components.next() else {
+            continue;
+        };
+        let Some(child_name) = child_name.to_str() else {
+            continue;
+        };
+        found_directory = true;
+        let child_is_directory = is_directory || components.next().is_some();
+        children
+            .entry(child_name.to_owned())
+            .and_modify(|is_directory| *is_directory |= child_is_directory)
+            .or_insert(child_is_directory);
+    }
+
+    Ok(found_directory.then(|| {
+        children
+            .into_iter()
+            .map(|(name, is_directory)| CrateDirectoryEntry { name, is_directory })
+            .collect()
+    }))
+}
+
+fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.+".contains(character))
 }
 
 /// Opens the archive and returns an iterable Archive on success
@@ -272,7 +416,7 @@ fn default_readme_rank(filename: &str) -> Option<usize> {
     }
 }
 
-fn render_markdown(markdown: &str) -> String {
+fn render_markdown(markdown: &str, crate_name: &str, version: &str, readme_path: &Path) -> String {
     let mut options = comrak::Options::default();
     options.extension.alerts = true;
     options.extension.autolink = true;
@@ -285,6 +429,18 @@ fn render_markdown(markdown: &str) -> String {
     options.extension.shortcodes = true;
     options.extension.header_id_prefix = Some("user-content-".to_string());
     options.extension.header_id_prefix_in_href = true;
+    let link_crate_name = crate_name.to_owned();
+    let link_version = version.to_owned();
+    let link_readme_path = readme_path.to_path_buf();
+    options.extension.link_url_rewriter = Some(std::sync::Arc::new(move |url: &str| {
+        rewrite_crate_url(url, &link_crate_name, &link_version, &link_readme_path)
+    }));
+    let image_crate_name = crate_name.to_owned();
+    let image_version = version.to_owned();
+    let image_readme_path = readme_path.to_path_buf();
+    options.extension.image_url_rewriter = Some(std::sync::Arc::new(move |url: &str| {
+        rewrite_crate_url(url, &image_crate_name, &image_version, &image_readme_path)
+    }));
     options.render.r#unsafe = true;
     let adapter = SYNTECT_ADAPTER.get_or_init(|| {
         comrak::plugins::syntect::SyntectAdapterBuilder::new()
@@ -334,6 +490,105 @@ fn render_markdown(markdown: &str) -> String {
     sanitizer.clean(&html).to_string()
 }
 
+fn rewrite_crate_url(url: &str, crate_name: &str, version: &str, readme_path: &Path) -> String {
+    if url.starts_with('#') {
+        return url.to_owned();
+    }
+    if let Ok(parsed_url) = Url::parse(url) {
+        if let Some(local_crate_url) = rewrite_crates_io_crate_url(&parsed_url) {
+            return local_crate_url;
+        }
+    }
+    let mut base = Url::parse("https://panamax.invalid/").expect("static base URL is valid");
+    base.set_path(&format!("/{}", readme_path.to_string_lossy()));
+
+    let destination = match Url::parse(url) {
+        Ok(url) if is_loopback_url(&url) => {
+            let path_and_suffix = format!(
+                "{}{}{}",
+                url.path(),
+                url.query()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default(),
+                url.fragment()
+                    .map(|fragment| format!("#{fragment}"))
+                    .unwrap_or_default()
+            );
+            let root = Url::parse("https://panamax.invalid/").expect("static base URL is valid");
+            root.join(&path_and_suffix).ok()
+        }
+        Ok(_) => return url.to_owned(),
+        Err(_) if url.starts_with("//") => return url.to_owned(),
+        Err(_) => base.join(url).ok(),
+    };
+    let Some(destination) = destination else {
+        return url.to_owned();
+    };
+    if destination.host_str() != Some("panamax.invalid") {
+        return url.to_owned();
+    }
+
+    format!(
+        "/crate/{crate_name}/{version}/source{}{}{}",
+        destination.path(),
+        destination
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default(),
+        destination
+            .fragment()
+            .map(|fragment| format!("#{fragment}"))
+            .unwrap_or_default()
+    )
+}
+
+fn rewrite_crates_io_crate_url(url: &Url) -> Option<String> {
+    if !matches!(url.scheme(), "http" | "https")
+        || !matches!(url.host_str(), Some("crates.io" | "www.crates.io"))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "crates" {
+        return None;
+    }
+    let name = segments.next()?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return None;
+    }
+    if segments.next().is_some_and(|segment| !segment.is_empty()) || segments.next().is_some() {
+        return None;
+    }
+
+    Some(format!(
+        "/crate/{name}{}{}",
+        url.query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default(),
+        url.fragment()
+            .map(|fragment| format!("#{fragment}"))
+            .unwrap_or_default()
+    ))
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && match url.host() {
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            Some(Host::Domain(domain)) => domain == "localhost" || domain.ends_with(".localhost"),
+            None => false,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -359,8 +614,11 @@ mod tests {
                 ),
                 (
                     "docs/INTRO.md",
-                    "# Hello\n\n**World** :balloon:\n\n[Guide](guide.md) ![Logo](logo.png)\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>",
+                    "# Hello\n\n**World** :balloon:\n\n[Guide](guide.md) ![Logo](logo.png) [Examples](/examples) [Loopback](http://127.0.0.1:8080/examples) [Anchor](#user-content-hello) [External](https://example.com/docs)\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>",
                 ),
+                ("docs/guide.md", "# Local guide"),
+                ("docs/logo.png", "not really a png"),
+                ("examples/README.md", "# Examples"),
             ],
         );
 
@@ -369,15 +627,54 @@ mod tests {
             .unwrap();
         assert!(rendered.contains("<strong>World</strong>"));
         assert!(rendered.contains("🎈"));
-        assert!(
-            rendered.contains("href=\"https://codeberg.org/example/foo/blob/HEAD/docs/guide.md\"")
+        assert!(rendered.contains("href=\"/crate/foo/1.0.0/source/docs/guide.md\""));
+        assert!(rendered.contains("src=\"/crate/foo/1.0.0/source/docs/logo.png\""));
+        assert_eq!(
+            rendered
+                .matches("href=\"/crate/foo/1.0.0/source/examples\"")
+                .count(),
+            2
         );
-        assert!(
-            rendered.contains("src=\"https://codeberg.org/example/foo/raw/HEAD/docs/logo.png\"")
-        );
+        assert!(rendered.contains("href=\"#user-content-hello\""));
+        assert!(rendered.contains("href=\"https://example.com/docs\""));
         assert!(rendered.contains("style=\"color:"));
         assert!(!rendered.contains("<script>"));
         assert!(!rendered.contains("unsafe"));
+    }
+
+    #[test]
+    fn rewrites_only_direct_crates_io_crate_links() {
+        let readme_path = Path::new("README.md");
+        assert_eq!(
+            rewrite_crate_url(
+                "https://crates.io/crates/atty",
+                "current-crate",
+                "1.0.0",
+                readme_path,
+            ),
+            "/crate/atty"
+        );
+        assert_eq!(
+            rewrite_crate_url(
+                "https://crates.io/crates/atty/?source=readme#details",
+                "current-crate",
+                "1.0.0",
+                readme_path,
+            ),
+            "/crate/atty?source=readme#details"
+        );
+
+        for url in [
+            "https://crates.io/crates/atty/0.2.14",
+            "https://crates.io/crates/atty/versions",
+            "https://crates.io/categories",
+            "https://example.com/crates/atty",
+        ] {
+            assert_eq!(
+                rewrite_crate_url(url, "current-crate", "1.0.0", readme_path),
+                url
+            );
+        }
     }
 
     #[test]
@@ -401,6 +698,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rendered.contains("The default README"));
+    }
+
+    #[test]
+    fn reads_crate_files_and_rejects_paths_outside_the_archive() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        write_crate_archive(
+            mirror_path,
+            "foo",
+            "1.0.0",
+            &[
+                ("Cargo.toml", "[package]\nname = \"foo\"\n"),
+                ("examples/demo.rs", "fn main() {}"),
+            ],
+        );
+
+        assert_eq!(
+            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("examples/demo.rs"))
+                .unwrap()
+                .unwrap(),
+            b"fn main() {}"
+        );
+        assert_eq!(
+            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("missing")).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("../Cargo.toml"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            list_crate_directory(mirror_path, "foo", "1.0.0", Path::new("examples"))
+                .unwrap()
+                .unwrap(),
+            vec![CrateDirectoryEntry {
+                name: "demo.rs".to_owned(),
+                is_directory: false,
+            }]
+        );
     }
 
     #[test]
