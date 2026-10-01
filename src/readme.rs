@@ -112,6 +112,7 @@ enum ReadmeLocation {
 }
 
 /// A README and its location within a crate archive.
+/// The path is required to allow rewriting of relative links
 struct ArchiveReadme {
     /// The README path relative to the crate archive root.
     path: PathBuf,
@@ -161,7 +162,7 @@ fn read_archive_readme(
                 entry.read_to_string(&mut contents)?;
                 let relative_path = entry_path
                     .strip_prefix(&root)
-                    .expect("explicit README path is under the crate root")
+                    .map_err(std::io::Error::other)?
                     .to_path_buf();
                 return Ok(Some(ArchiveReadme {
                     path: relative_path,
@@ -223,17 +224,26 @@ pub(crate) fn read_crate_file(
     version: &str,
     relative_path: &Path,
 ) -> io::Result<Option<Vec<u8>>> {
+    // Crate name and version are untrusted input, so validate before constructing paths
     if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid crate name or version",
         ));
     }
-    let relative_path = normalize_readme_path(relative_path)
+
+    // Normalize the crate relative path - e.g. removing './', failing on '..'
+    let relative_path = normalize_path_within_crate(relative_path)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate archive path"))?;
+
+    // Determine the path to the crate on disk
     let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
+
+    // A crate archive contains a single folder in the form {name}-{version}
     let target_path = PathBuf::from(format!("{crate_name}-{version}")).join(relative_path);
+
+    // Open the archive and iterate until we find the requested entry
     let mut archive = open_archive(&archive_path)?;
 
     for entry in archive.entries()? {
@@ -248,9 +258,13 @@ pub(crate) fn read_crate_file(
     Ok(None)
 }
 
+/// An entry within the crate
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CrateDirectoryEntry {
+    /// The file or directory name
     pub name: String,
+
+    /// If this entry is a directory
     pub is_directory: bool,
 }
 
@@ -261,23 +275,34 @@ pub(crate) fn list_crate_directory(
     version: &str,
     relative_path: &Path,
 ) -> io::Result<Option<Vec<CrateDirectoryEntry>>> {
+    // Crate name and version are untrusted input, so validate before constructing paths
     if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid crate name or version",
         ));
     }
+
+    // Normalize the crate relative path - e.g. removing './', failing on '..'
     let relative_path = if relative_path.as_os_str().is_empty() {
         PathBuf::new()
     } else {
-        normalize_readme_path(relative_path).ok_or_else(|| {
+        normalize_path_within_crate(relative_path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid crate archive path")
         })?
     };
+
+    // Determine the path to the crate on disk
     let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
+
+    // A crate archive contains a single folder in the form {name}-{version}
     let archive_root = PathBuf::from(format!("{crate_name}-{version}"));
     let target_path = archive_root.join(&relative_path);
+
+    // Open the archive and iterate until we find the requested directory
+    // When we find it, iterate through it's children and add them to a BTreeMap,
+    // which provides sorting alphabetically
     let mut archive = open_archive(&archive_path)?;
     let mut found_directory = relative_path.as_os_str().is_empty();
     let mut children = BTreeMap::<String, bool>::new();
@@ -289,11 +314,15 @@ pub(crate) fn list_crate_directory(
         if !entry_type.is_file() && !entry_type.is_dir() {
             continue;
         }
+
+        // If the entry is the requested directory, track that so we can indicate we found it
         let is_directory = entry_type.is_dir();
         if entry_path == target_path {
             found_directory |= is_directory;
             continue;
         }
+
+        // Extract the names of the directory entries
         let Ok(descendant) = entry_path.strip_prefix(&target_path) else {
             continue;
         };
@@ -304,7 +333,12 @@ pub(crate) fn list_crate_directory(
         let Some(child_name) = child_name.to_str() else {
             continue;
         };
+
+        // If for some reason we didn't find the directory itself, but have found a child of it,
+        // track that we've found the directory
         found_directory = true;
+
+        // Add to list of children
         let child_is_directory = is_directory || components.next().is_some();
         children
             .entry(child_name.to_owned())
@@ -320,6 +354,8 @@ pub(crate) fn list_crate_directory(
     }))
 }
 
+/// Checks that a path segment is safe. It checks it's not . or .., then ensures it's
+/// in [a-zA-Z0-9-_.+]. This should prevent path traversal attacks
 fn is_safe_path_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
@@ -380,7 +416,7 @@ fn determine_readme_location(manifest: &str) -> io::Result<ReadmeLocation> {
     let location = match package.get("readme") {
         Some(readme) if readme.as_bool() == Some(false) => ReadmeLocation::NotPresent,
         Some(readme) if readme.as_str().is_some() => {
-            normalize_readme_path(Path::new(readme.as_str().unwrap()))
+            normalize_path_within_crate(Path::new(readme.as_str().unwrap()))
                 .map(ReadmeLocation::Explicit)
                 .unwrap_or(ReadmeLocation::NotPresent)
         }
@@ -392,7 +428,7 @@ fn determine_readme_location(manifest: &str) -> io::Result<ReadmeLocation> {
 /// Transforms the readme path into a standard form.
 /// Any '.' part is skipped
 /// Any '..' part is considered an error, and results in None
-fn normalize_readme_path(path: &Path) -> Option<PathBuf> {
+fn normalize_path_within_crate(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -429,19 +465,27 @@ fn render_markdown(markdown: &str, crate_name: &str, version: &str, readme_path:
     options.extension.shortcodes = true;
     options.extension.header_id_prefix = Some("user-content-".to_string());
     options.extension.header_id_prefix_in_href = true;
+
+    // Rewrite link URLs
     let link_crate_name = crate_name.to_owned();
     let link_version = version.to_owned();
     let link_readme_path = readme_path.to_path_buf();
     options.extension.link_url_rewriter = Some(std::sync::Arc::new(move |url: &str| {
         rewrite_crate_url(url, &link_crate_name, &link_version, &link_readme_path)
     }));
+
+    // Rewrite image URLs
     let image_crate_name = crate_name.to_owned();
     let image_version = version.to_owned();
     let image_readme_path = readme_path.to_path_buf();
     options.extension.image_url_rewriter = Some(std::sync::Arc::new(move |url: &str| {
         rewrite_crate_url(url, &image_crate_name, &image_version, &image_readme_path)
     }));
+
+    // Allow arbitrary HTML
     options.render.r#unsafe = true;
+
+    // Add code block syntax highlightin
     let adapter = SYNTECT_ADAPTER.get_or_init(|| {
         comrak::plugins::syntect::SyntectAdapterBuilder::new()
             .theme("base16-ocean.dark")
@@ -449,8 +493,11 @@ fn render_markdown(markdown: &str, crate_name: &str, version: &str, readme_path:
     });
     let mut plugins = comrak::options::Plugins::default();
     plugins.render.codefence_syntax_highlighter = Some(adapter);
+
+    // Render to HTML
     let html = comrak::markdown_to_html_with_plugins(markdown, &options, &plugins);
 
+    // Sanitize the HTML
     let mut sanitizer = Builder::default();
     sanitizer
         .add_tags(&["input", "ol", "picture", "section", "source"])
@@ -490,10 +537,14 @@ fn render_markdown(markdown: &str, crate_name: &str, version: &str, readme_path:
     sanitizer.clean(&html).to_string()
 }
 
+/// Given a URL within rendered HTML, rewrite it so that it can be resolved as a file within
+/// the crate archive
 fn rewrite_crate_url(url: &str, crate_name: &str, version: &str, readme_path: &Path) -> String {
     if url.starts_with('#') {
         return url.to_owned();
     }
+
+    // Links to crates.io are resolved to other crates on the mirror
     if let Ok(parsed_url) = Url::parse(url) {
         if let Some(local_crate_url) = rewrite_crates_io_crate_url(&parsed_url) {
             return local_crate_url;

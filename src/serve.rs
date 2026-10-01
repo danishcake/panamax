@@ -875,7 +875,7 @@ mod tests {
         assert!(!rendered.contains("href=\"data:text/html,unsafe\""));
         assert!(rendered.contains("href=\"/crate/serde_derive\""));
         assert!(rendered.contains("serde_derive"));
-        assert!(rendered.contains("href=\"/crate/serde/1.0.0/source/\">Browse contents</a>"));
+        assert!(rendered.contains("href=\"/crate/serde/1.0.0/source/\">Browse</a>"));
         assert!(rendered.find("README</h2>").unwrap() < rendered.find("Versions</h2>").unwrap());
     }
 
