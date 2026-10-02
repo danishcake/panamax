@@ -8,7 +8,7 @@
 
 <body class="browser-page">
     <main class="browser-content crate-page-content">
-        <p class="page-kicker"><a href="/">Panamax</a> / <a href="{{ crate_url }}">{{ crate_name }}</a> / files</p>
+        <p class="page-kicker"><a href="/">Panamax</a> / <a href="{{ crate_url }}">{{ crate_name }}</a> / files{% if !path.is_empty() %} / {{ path }}{% endif %}</p>
         <h1>{{ crate_name }} files</h1>
         <p class="muted">Version {{ version }}</p>
         <section class="detail-section crate-source-listing">

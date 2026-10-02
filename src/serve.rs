@@ -68,6 +68,7 @@ struct CrateSourceTemplate {
     crate_name: String,
     version: String,
     crate_url: String,
+    path: String,
     parent_url: Option<String>,
     entries: Vec<CrateSourceEntry>,
 }
@@ -607,6 +608,7 @@ fn render_crate_directory_listing(
         crate_name: crate_name.to_owned(),
         version: version.to_owned(),
         crate_url: format!("/crate/{crate_name}"),
+        path: path.to_string_lossy().into_owned(),
         parent_url: (!path.as_os_str().is_empty()).then(|| {
             let parent_path = path.parent().unwrap_or_else(|| std::path::Path::new(""));
             let encoded_parent = encode_archive_path(parent_path);
@@ -910,6 +912,7 @@ mod tests {
 
         assert!(rendered.contains("class=\"browser-content crate-page-content\""));
         assert!(rendered.contains("class=\"detail-section crate-source-listing\""));
+        assert!(rendered.contains("/ files / examples</p>"));
         assert!(rendered.contains(
             "href=\"/crate/foo/1.0.0/source/examples/demo%20%3Cone%3E%2Ers\">demo &lt;one&gt;.rs</a>"
         ));
