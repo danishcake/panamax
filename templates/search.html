@@ -6,6 +6,24 @@
     <link rel="stylesheet" href="/static/css/panamax.css">
 </head>
 
+{% macro pagination(query, page, total_pages) %}
+<nav class="pagination" aria-label="Search result pages">
+    {% if page > 1 %}
+    <form action="/search.html" method="get">
+        <input type="hidden" name="q" value="{{ query }}">
+        <button type="submit" name="page" value="{{ page - 1 }}">Previous</button>
+    </form>
+    {% endif %}
+    <span>Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <form action="/search.html" method="get">
+        <input type="hidden" name="q" value="{{ query }}">
+        <button type="submit" name="page" value="{{ page + 1 }}">Next</button>
+    </form>
+    {% endif %}
+</nav>
+{% endmacro %}
+
 <body class="browser-page">
     <main class="browser-content">
         <p class="page-kicker"><a href="/">Panamax</a> / crate search</p>
@@ -26,21 +44,7 @@
         {% else %}
         <p class="result-summary">{{ total }} matching crate{% if total != 1 %}s{% endif %}.</p>
         {% if total_pages > 1 %}
-        <nav class="pagination" aria-label="Search result pages">
-            {% if page > 1 %}
-            <form action="/search.html" method="get">
-                <input type="hidden" name="q" value="{{ query }}">
-                <button type="submit" name="page" value="{{ page - 1 }}">Previous</button>
-            </form>
-            {% endif %}
-            <span>Page {{ page }} of {{ total_pages }}</span>
-            {% if page < total_pages %}
-            <form action="/search.html" method="get">
-                <input type="hidden" name="q" value="{{ query }}">
-                <button type="submit" name="page" value="{{ page + 1 }}">Next</button>
-            </form>
-            {% endif %}
-        </nav>
+        {% call pagination(query, page, total_pages) %}
         {% endif %}
         {% if results.is_empty() %}
         <p class="notice">No crates matched <strong>{{ query }}</strong>.</p>
@@ -60,21 +64,7 @@
         </ul>
         {% endif %}
         {% if total_pages > 1 %}
-        <nav class="pagination" aria-label="Search result pages">
-            {% if page > 1 %}
-            <form action="/search.html" method="get">
-                <input type="hidden" name="q" value="{{ query }}">
-                <button type="submit" name="page" value="{{ page - 1 }}">Previous</button>
-            </form>
-            {% endif %}
-            <span>Page {{ page }} of {{ total_pages }}</span>
-            {% if page < total_pages %}
-            <form action="/search.html" method="get">
-                <input type="hidden" name="q" value="{{ query }}">
-                <button type="submit" name="page" value="{{ page + 1 }}">Next</button>
-            </form>
-            {% endif %}
-        </nav>
+        {% call pagination(query, page, total_pages) %}
         {% endif %}
         {% endif %}
     </main>

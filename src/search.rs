@@ -34,7 +34,7 @@ const DEFAULT_PER_PAGE: usize = 10;
 
 /// The maximum number of results to return in a single page. This matches
 /// the maximum supported by cargo search
-const MAX_PER_PAGE: usize = 100;
+pub(crate) const MAX_PER_PAGE: usize = 100;
 
 /// Errors raised while building or querying the local search database.
 #[derive(Debug, Error)]
@@ -298,18 +298,7 @@ impl SearchIndex {
         })?;
 
         let query = query.trim();
-        if query.is_empty() {
-            // TODO explain
-            query_database(&connection, None, query, per_page, page)
-        } else if query.chars().count() < 3 {
-            // FTS5's trigram tokenizer cannot index one- or two-character terms.
-            let pattern = like_literal_pattern(query);
-            query_database(&connection, Some(&pattern), query, per_page, page)
-        } else {
-            // Quote the user input so FTS5 syntax cannot be injected through the query string.
-            let fts_query = fts_literal_query(query);
-            query_database(&connection, Some(&fts_query), query, per_page, page)
-        }
+        query_database(&connection, &SearchQuery::new(query), query, per_page, page)
     }
 
     /// Look up a crate by name without matching descriptions or dependencies.
@@ -370,11 +359,46 @@ fn like_literal_pattern(query: &str) -> String {
     format!("%{query}%")
 }
 
-/// Encode input as a full text search phrase.
-fn fts_literal_query(query: &str) -> String {
-    // Replace any double quotes with a a pair (" -> "")
-    // then wrap the whole in double quotes
-    format!("\"{}\"", query.replace('"', "\"\""))
+/// How a user-supplied query is executed against the database.
+#[derive(Debug)]
+enum SearchQuery {
+    /// List every crate in the index. An empty query is only reachable through direct
+    /// requests to the endpoint: the web UI rejects empty queries and cargo always
+    /// provides a search term.
+    All,
+    /// Match terms too short for the FTS5 trigram tokenizer using a LIKE pattern.
+    Like(String),
+    /// Match a full text search query built by quoting every word of the user's input.
+    Fts(String),
+}
+
+impl SearchQuery {
+    fn new(query: &str) -> Self {
+        if query.is_empty() {
+            return SearchQuery::All;
+        }
+        // Quote each word so FTS5 syntax cannot be injected through the query string,
+        // and combine the words with AND so every word must match, in any order.
+        if let Some(fts_query) = fts_literal_query(query) {
+            SearchQuery::Fts(fts_query)
+        } else {
+            // FTS5's trigram tokenizer cannot index one- or two-character terms.
+            SearchQuery::Like(like_literal_pattern(query))
+        }
+    }
+}
+
+/// Encode input as a full text search query: each word is quoted (so FTS5 syntax cannot
+/// be injected) and the words are combined with AND, so a crate only matches when it
+/// contains every word, in any order. Words shorter than three characters cannot be
+/// indexed by the trigram tokenizer and are skipped. Returns None if no words remain.
+fn fts_literal_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .filter(|term| term.chars().count() >= 3)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    (!terms.is_empty()).then(|| terms.join(" AND "))
 }
 
 /// Build or rebuild the search database from local mirror files only.
@@ -620,8 +644,8 @@ fn initialize_schema(connection: &Connection) -> Result<(), SearchError> {
 fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord>, SearchError> {
     let file = BufReader::new(File::open(path)?);
     let mut crate_name = None;
-    let mut latest_version = None;
-    let mut latest_yanked_version = None;
+    let mut latest_version: Option<Version> = None;
+    let mut latest_yanked_version: Option<Version> = None;
     let mut versions = Vec::new();
     let mut latest_index_dependencies = Vec::new();
 
@@ -644,11 +668,6 @@ fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord
             })?;
         crate_name.get_or_insert(index_entry.name);
 
-        let candidate = VersionEntry {
-            version,
-            yanked: index_entry.yanked,
-        };
-        versions.push(candidate.clone());
         let index_dependencies = index_entry
             .deps
             .iter()
@@ -658,22 +677,25 @@ fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord
                 kind: dependency.kind.clone(),
             })
             .collect::<Vec<_>>();
-        // Keep only the two candidates needed by the search response.
-        let latest = if candidate.yanked {
+
+        // Keep only the two candidates needed by the search response. The version is
+        // only cloned when it becomes a new candidate, not once per index line.
+        let latest = if index_entry.yanked {
             &mut latest_yanked_version
         } else {
             &mut latest_version
         };
-        if latest
-            .as_ref()
-            .map(|current: &VersionEntry| candidate.version > current.version)
-            .unwrap_or(true)
-        {
-            *latest = Some(candidate);
+        let is_new_latest = latest.as_ref().is_none_or(|current| &version > current);
+        if is_new_latest {
+            *latest = Some(version.clone());
             if !index_entry.yanked {
                 latest_index_dependencies = index_dependencies;
             }
         }
+        versions.push(VersionEntry {
+            version,
+            yanked: index_entry.yanked,
+        });
     }
 
     // If the crate name could not be identified then return None.
@@ -718,8 +740,8 @@ fn read_index_file(mirror_path: &Path, path: &Path) -> Result<Option<CrateRecord
 
     Ok(Some(CrateRecord {
         name: crate_name,
-        latest_version: latest_version.map(|entry| entry.version.to_string()),
-        latest_yanked_version: latest_yanked_version.map(|entry| entry.version.to_string()),
+        latest_version: latest_version.map(|version| version.to_string()),
+        latest_yanked_version: latest_yanked_version.map(|version| version.to_string()),
         latest_available_version,
         available_versions,
         metadata,
@@ -793,13 +815,14 @@ fn read_manifest_metadata(
     };
 
     // Read the compressed archive as a stream; only Cargo.toml is retained in memory.
+    // Avoid accidentally using a nested Cargo.toml from an unusual archive.
+    let expected_root = format!("{crate_name}-{version}");
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?.to_path_buf();
-        let expected_root = format!("{crate_name}-{version}");
-        // Avoid accidentally using a nested Cargo.toml from an unusual archive.
+        // The manifest must be located directly inside the crate's root directory.
         let is_manifest = entry_path
             .file_name()
             .map(|name| name.eq_ignore_ascii_case("Cargo.toml"))
@@ -898,25 +921,25 @@ pub struct SearchResults {
 
 fn query_database(
     connection: &Connection,
-    search_query: Option<&str>,
+    search_query: &SearchQuery,
     display_query: &str,
     per_page: usize,
     requested_page: usize,
 ) -> Result<SearchResults, SearchError> {
     // Short terms use LIKE because trigram FTS cannot represent them; longer terms use FTS.
-    let (where_clause, bind_query) = match search_query {
-        Some(_) if display_query.chars().count() < 3 => (
+    let (where_clause, bind_query): (&str, Option<&str>) = match search_query {
+        SearchQuery::All => ("", None),
+        SearchQuery::Like(pattern) => (
             "WHERE lower(c.name) LIKE lower(?1) ESCAPE '\\'
                 OR lower(COALESCE(c.description, '')) LIKE lower(?1) ESCAPE '\\'
                 OR lower(c.search_keywords) LIKE lower(?1) ESCAPE '\\'
                 OR lower(c.search_categories) LIKE lower(?1) ESCAPE '\\'",
-            search_query,
+            Some(pattern),
         ),
-        Some(_) => (
+        SearchQuery::Fts(fts_query) => (
             "WHERE c.id IN (SELECT crate_id FROM crate_search WHERE crate_search MATCH ?1)",
-            search_query,
+            Some(fts_query),
         ),
-        None => ("", None),
     };
 
     let count_sql = format!(
@@ -1025,9 +1048,17 @@ mod tests {
             Some("A useful foo crate.")
         );
 
-        // SQL quotes, FTS operators, and LIKE wildcards must remain ordinary search text.
+        // Multi-word queries match crates containing every word, in any order.
+        assert_eq!(index.search("useful foo", None).unwrap().total, 1);
+        assert_eq!(index.search("foo useful", None).unwrap().total, 1);
+        assert_eq!(index.search("useful missing", None).unwrap().total, 0);
+        // Words too short for the trigram tokenizer are skipped, not fatal.
+        assert_eq!(index.search("foo io", None).unwrap().total, 1);
+
+        // SQL quotes, FTS operators, and LIKE wildcards must remain ordinary search text:
+        // "foo OR *" matches crates containing "foo", not crates matching "foo" OR anything.
         assert_eq!(index.search("' OR 1=1 --", None).unwrap().total, 0);
-        assert_eq!(index.search("foo OR *", None).unwrap().total, 0);
+        assert_eq!(index.search("foo OR *", None).unwrap().total, 1);
         assert_eq!(index.search("%", None).unwrap().total, 0);
     }
 
@@ -1087,6 +1118,35 @@ mod tests {
         let out_of_range = index.search_page("foo", Some(1), usize::MAX).unwrap();
         assert_eq!(out_of_range.page, 2);
         assert_eq!(out_of_range.crates[0].name, "food");
+    }
+
+    #[test]
+    fn empty_query_lists_every_crate() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let mirror_path = temporary_directory.path();
+        fs::create_dir_all(mirror_path.join("crates.io-index/3/f")).unwrap();
+        for name in ["foo", "food"] {
+            fs::write(
+                mirror_path.join(format!("crates.io-index/3/f/{name}")),
+                format!("{{\"name\":\"{name}\",\"vers\":\"1.0.0\",\"yanked\":false}}\n"),
+            )
+            .unwrap();
+        }
+        create_git_repo(mirror_path);
+        build(mirror_path).unwrap();
+
+        // An empty query lists every crate, paginated. The web UI rejects empty
+        // queries and cargo always provides a search term, so this is only reachable
+        // through direct requests to the endpoint.
+        let index = SearchIndex::open(mirror_path).unwrap();
+        let results = index.search("", Some(1)).unwrap();
+        assert_eq!(results.total, 2);
+        assert_eq!(results.total_pages, 2);
+        assert_eq!(results.crates.len(), 1);
+        assert_eq!(results.crates[0].name, "foo");
+
+        let second_page = index.search_page("", Some(1), 2).unwrap();
+        assert_eq!(second_page.crates[0].name, "food");
     }
 
     #[test]

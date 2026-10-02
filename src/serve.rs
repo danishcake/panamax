@@ -4,7 +4,7 @@ use askama::Template;
 use bytes::BytesMut;
 use futures_util::stream::TryStreamExt;
 use include_dir::{include_dir, Dir};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -96,23 +96,32 @@ impl Reject for ServeError {}
 
 #[derive(Deserialize)]
 struct CratesSearch {
-    q: String,
+    #[serde(rename = "q")]
+    query: String,
     per_page: Option<usize>,
 }
 
 async fn search(
-    p: &CratesSearch,
-    index: Option<&SearchIndex>,
+    search_args: CratesSearch,
+    index: Option<Arc<SearchIndex>>,
 ) -> Result<http::Response<String>, Rejection> {
     // Search is unavailable until the explicit offline build command has created the database.
     let Some(index) = index else {
         return Err(warp::reject::not_found());
     };
 
-    // Search the database
-    let results = index
-        .search(&p.q, p.per_page)
-        .map_err(|_| warp::reject::not_found())?;
+    // Search the database off the async worker threads, as SQLite queries block
+    let display_query = search_args.query.clone();
+    let results = tokio::task::spawn_blocking(move || index.search(&search_args.query, search_args.per_page))
+        .await
+        .map_err(|error| {
+            log::error!("Cargo search task failed for `{display_query}`: {error}");
+            warp::reject::custom(ServeError::Other(error.to_string()))
+        })?
+        .map_err(|error| {
+            log::error!("Cargo search failed for `{display_query}`: {error}");
+            warp::reject::custom(ServeError::Other(error.to_string()))
+        })?;
 
     // Convert to Cargo's registry search response structure
     let crates = results
@@ -127,12 +136,12 @@ async fn search(
     let meta = TotalCrates {
         total: results.total,
     };
-    let body =
-        serde_json::to_string(&Crates { crates, meta }).map_err(|_| warp::reject::not_found())?;
+    let body = serde_json::to_string(&Crates { crates, meta })
+        .map_err(|error| warp::reject::custom(ServeError::Other(error.to_string())))?;
     Response::builder()
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(body)
-        .map_err(|_| warp::reject::not_found())
+        .map_err(|error| warp::reject::custom(ServeError::from(error)))
 }
 
 /// Show details about an in-browser search
@@ -169,10 +178,24 @@ async fn browser_search(
         });
     }
 
-    // Search the database
-    let results = index
-        .search_page(&query, Some(BROWSER_SEARCH_PER_PAGE), requested_page)
-        .map_err(|_| warp::reject::not_found())?;
+    // Search the database off the async worker threads, as SQLite queries block
+    let search_query = query.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        index.search_page(
+            &search_query,
+            Some(crate::search::MAX_PER_PAGE),
+            requested_page,
+        )
+    })
+    .await
+    .map_err(|error| {
+        log::error!("Browser search task failed for `{query}`: {error}");
+        warp::reject::custom(ServeError::Other(error.to_string()))
+    })?
+    .map_err(|error| {
+        log::error!("Browser search failed for `{query}`: {error}");
+        warp::reject::custom(ServeError::Other(error.to_string()))
+    })?;
     Ok(SearchTemplate {
         query,
         results: results.crates,
@@ -194,10 +217,18 @@ async fn crate_details(
         return Err(warp::reject::not_found());
     };
 
-    // Search the database
-    let details = index
-        .crate_details(&name)
-        .map_err(|_| warp::reject::not_found())?
+    // Search the database off the async worker threads, as SQLite queries block
+    let display_name = name.clone();
+    let details = tokio::task::spawn_blocking(move || index.crate_details(&name))
+        .await
+        .map_err(|error| {
+            log::error!("Crate details task failed for {display_name}: {error}");
+            warp::reject::custom(ServeError::Other(error.to_string()))
+        })?
+        .map_err(|error| {
+            log::error!("Could not read crate details for {display_name}: {error}");
+            warp::reject::custom(ServeError::Other(error.to_string()))
+        })?
         .ok_or_else(warp::reject::not_found)?;
 
     // Render the crate README to a snippet of HTML
@@ -254,8 +285,6 @@ struct BrowserSearch {
     q: Option<String>,
     page: Option<usize>,
 }
-
-const BROWSER_SEARCH_PER_PAGE: usize = 100;
 
 pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<TlsConfig>) {
     let index_path = path.clone();
@@ -326,9 +355,9 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     let search_index_for_route = search_index.clone();
     let crates_search = warp::path::path("crates")
         .and(warp::query::<CratesSearch>())
-        .and_then(move |p: CratesSearch| {
+        .and_then(move |search_args: CratesSearch| {
             let search_index = search_index_for_route.clone();
-            async move { search(&p, search_index.as_deref()).await }
+            async move { search(search_args, search_index).await }
         });
 
     // Handle all files baked into the binary with include_dir, at /static
@@ -476,52 +505,44 @@ async fn crate_source_file_response(
         .decode_utf8()
         .map_err(|_| warp::reject::not_found())?;
     let relative_path = PathBuf::from(decoded_path.as_ref());
-    let contents = if relative_path.as_os_str().is_empty() {
-        None
-    } else {
-        let read_path = relative_path.clone();
-        let file_mirror_path = mirror_path.clone();
-        let file_crate_name = crate_name.clone();
-        let file_version = version.clone();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                crate::readme::read_crate_file(
-                    &file_mirror_path,
-                    &file_crate_name,
-                    &file_version,
-                    &read_path,
-                )
-            })
-            .await
-            .map_err(|_| warp::reject::not_found())?
-            .map_err(|_| warp::reject::not_found())?,
-        )
-    };
 
-    if let Some(Some(contents)) = contents {
-        let content_type = crate_file_content_type(&relative_path);
-        return source_response(contents, &content_type);
-    }
-
-    let listing_mirror_path = mirror_path.clone();
-    let listing_crate_name = crate_name.clone();
-    let listing_version = version.clone();
-    let listing_path = relative_path.clone();
-    let entries = tokio::task::spawn_blocking(move || {
-        crate::readme::list_crate_directory(
-            &listing_mirror_path,
-            &listing_crate_name,
-            &listing_version,
-            &listing_path,
+    // Read the file or directory listing off the async worker threads. A single pass
+    // over the archive serves both cases, so a README link to a directory does not
+    // decompress the archive twice.
+    let browse_path = relative_path.clone();
+    let browse_mirror_path = mirror_path.clone();
+    let browse_crate_name = crate_name.clone();
+    let browse_version = version.clone();
+    let entry = tokio::task::spawn_blocking(move || {
+        crate::readme::browse_crate_archive(
+            &browse_mirror_path,
+            &browse_crate_name,
+            &browse_version,
+            &browse_path,
         )
     })
     .await
-    .map_err(|_| warp::reject::not_found())?
-    .map_err(|_| warp::reject::not_found())?
-    .ok_or_else(warp::reject::not_found)?;
+    .map_err(|error| {
+        log::error!("Crate source task failed for {crate_name} {version}: {error}");
+        warp::reject::custom(ServeError::Other(error.to_string()))
+    })?
+    .map_err(|error| {
+        log::error!("Could not browse crate source for {crate_name} {version}: {error}");
+        warp::reject::custom(ServeError::Other(error.to_string()))
+    })?;
 
-    let listing = render_crate_directory_listing(&crate_name, &version, &relative_path, &entries)?;
-    source_response(listing.into_bytes(), "text/html; charset=utf-8")
+    match entry {
+        Some(crate::readme::CrateArchiveEntry::File(contents)) => {
+            let content_type = crate_file_content_type(&relative_path);
+            source_response(contents, &content_type)
+        }
+        Some(crate::readme::CrateArchiveEntry::Directory(entries)) => {
+            let listing =
+                render_crate_directory_listing(&crate_name, &version, &relative_path, &entries)?;
+            source_response(listing.into_bytes(), "text/html; charset=utf-8")
+        }
+        None => Err(warp::reject::not_found()),
+    }
 }
 
 fn source_response(
@@ -598,7 +619,10 @@ fn render_crate_directory_listing(
         entries,
     }
     .render()
-    .map_err(|error| warp::reject::custom(ServeError::Other(error.to_string())))
+    .map_err(|error| {
+        log::error!("Could not render crate directory listing: {error}");
+        warp::reject::custom(ServeError::Other(error.to_string()))
+    })
 }
 
 fn encode_archive_path(path: &std::path::Path) -> String {
@@ -613,15 +637,7 @@ fn encode_archive_path(path: &std::path::Path) -> String {
 }
 
 fn encode_path_segment(segment: &str) -> String {
-    let mut encoded = String::new();
-    for byte in segment.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+    utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 /// Get all rustup platforms available on the mirror.
@@ -895,10 +911,23 @@ mod tests {
         assert!(rendered.contains("class=\"browser-content crate-page-content\""));
         assert!(rendered.contains("class=\"detail-section crate-source-listing\""));
         assert!(rendered.contains(
-            "href=\"/crate/foo/1.0.0/source/examples/demo%20%3Cone%3E.rs\">demo &lt;one&gt;.rs</a>"
+            "href=\"/crate/foo/1.0.0/source/examples/demo%20%3Cone%3E%2Ers\">demo &lt;one&gt;.rs</a>"
         ));
         assert!(rendered.contains("href=\"/crate/foo/1.0.0/source/\">..</a>"));
         assert!(!rendered.contains("demo <one>.rs</a>"));
+
+        // Non-ASCII filenames are percent-encoded as UTF-8 bytes
+        let rendered = render_crate_directory_listing(
+            "foo",
+            "1.0.0",
+            std::path::Path::new(""),
+            &[crate::readme::CrateDirectoryEntry {
+                name: "démonstration".to_owned(),
+                is_directory: true,
+            }],
+        )
+        .unwrap();
+        assert!(rendered.contains("href=\"/crate/foo/1.0.0/source/d%C3%A9monstration/\""));
 
         let root_listing =
             render_crate_directory_listing("foo", "1.0.0", std::path::Path::new(""), &[]).unwrap();

@@ -45,7 +45,7 @@ const CODE_CLASSES: &[&str] = &[
     "language-markup",
 ];
 
-type ReadmeCache = Mutex<LruCache<PathBuf, Option<Arc<str>>>>;
+type ReadmeCache = Mutex<LruCache<PathBuf, Arc<str>>>;
 
 /// The cache of previously rendered READMEs
 static README_CACHE: OnceLock<ReadmeCache> = OnceLock::new();
@@ -63,28 +63,31 @@ pub fn render_crate_readme(
 
     // Return the cached rendering if possible
     if let Some(rendered) = cache_get(&archive_path) {
-        return Ok(rendered);
+        return Ok(Some(rendered));
     }
 
     // Otherwise render and put into the cache
-    let rendered = read_archive_readme(&archive_path, crate_name, version)?.map(|readme| {
-        Arc::<str>::from(render_markdown(
-            &readme.contents,
-            crate_name,
-            version,
-            &readme.path,
-        ))
-    });
+    let Some(readme) = read_archive_readme(&archive_path, crate_name, version)? else {
+        // Crates without a README are not cached: a later sync may download the
+        // archive, or download an archive containing one.
+        return Ok(None);
+    };
+    let rendered = Arc::<str>::from(render_markdown(
+        &readme.contents,
+        crate_name,
+        version,
+        &readme.path,
+    ));
     cache_insert(archive_path, rendered.clone());
-    Ok(rendered)
+    Ok(Some(rendered))
 }
 
-fn cache_get(key: &Path) -> Option<Option<Arc<str>>> {
+fn cache_get(key: &Path) -> Option<Arc<str>> {
     let cache = readme_cache();
     cache.lock().ok()?.get(key).cloned()
 }
 
-fn cache_insert(key: PathBuf, rendered: Option<Arc<str>>) {
+fn cache_insert(key: PathBuf, rendered: Arc<str>) {
     let cache = readme_cache();
     if let Ok(mut cache) = cache.lock() {
         cache.put(key, rendered);
@@ -217,49 +220,18 @@ fn read_archive_readme(
     Ok(best_default.map(|(_, readme)| readme))
 }
 
-/// Read a file from a crate archive using a path relative to the crate root.
-pub(crate) fn read_crate_file(
-    mirror_path: &Path,
-    crate_name: &str,
-    version: &str,
-    relative_path: &Path,
-) -> io::Result<Option<Vec<u8>>> {
-    // Crate name and version are untrusted input, so validate before constructing paths
-    if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid crate name or version",
-        ));
-    }
+/// A path within a crate archive: either a file's contents, or a directory listing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CrateArchiveEntry {
+    /// The requested path is a file, along with its contents.
+    File(Vec<u8>),
 
-    // Normalize the crate relative path - e.g. removing './', failing on '..'
-    let relative_path = normalize_path_within_crate(relative_path)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate archive path"))?;
-
-    // Determine the path to the crate on disk
-    let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
-
-    // A crate archive contains a single folder in the form {name}-{version}
-    let target_path = PathBuf::from(format!("{crate_name}-{version}")).join(relative_path);
-
-    // Open the archive and iterate until we find the requested entry
-    let mut archive = open_archive(&archive_path)?;
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if entry.header().entry_type().is_file() && entry.path()?.as_ref() == target_path.as_path()
-        {
-            let mut contents = Vec::new();
-            entry.read_to_end(&mut contents)?;
-            return Ok(Some(contents));
-        }
-    }
-    Ok(None)
+    /// The requested path is a directory, along with its sorted entries.
+    Directory(Vec<CrateDirectoryEntry>),
 }
 
 /// An entry within the crate
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrateDirectoryEntry {
     /// The file or directory name
     pub name: String,
@@ -268,13 +240,17 @@ pub(crate) struct CrateDirectoryEntry {
     pub is_directory: bool,
 }
 
-/// List the direct children of a directory in a crate archive.
-pub(crate) fn list_crate_directory(
+/// Look up a path within a crate archive, returning either the file's contents or a
+/// listing of the directory. A single pass over the archive serves both cases, so a
+/// README link to a directory does not require decompressing the archive twice.
+/// Directory listings are cached, as browsing a crate's source generates many
+/// requests against the same archive.
+pub(crate) fn browse_crate_archive(
     mirror_path: &Path,
     crate_name: &str,
     version: &str,
     relative_path: &Path,
-) -> io::Result<Option<Vec<CrateDirectoryEntry>>> {
+) -> io::Result<Option<CrateArchiveEntry>> {
     // Crate name and version are untrusted input, so validate before constructing paths
     if !is_safe_path_segment(crate_name) || !is_safe_path_segment(version) {
         return Err(io::Error::new(
@@ -296,27 +272,40 @@ pub(crate) fn list_crate_directory(
     let archive_path = crate::crates::get_crate_path(mirror_path, crate_name, version)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid crate name"))?;
 
+    // Return a cached listing when possible
+    if let Some(entries) = directory_cache_get(&archive_path, &relative_path) {
+        return Ok(Some(CrateArchiveEntry::Directory(entries)));
+    }
+
     // A crate archive contains a single folder in the form {name}-{version}
     let archive_root = PathBuf::from(format!("{crate_name}-{version}"));
     let target_path = archive_root.join(&relative_path);
 
-    // Open the archive and iterate until we find the requested directory
-    // When we find it, iterate through it's children and add them to a BTreeMap,
-    // which provides sorting alphabetically
+    // Open the archive and iterate through the entries. A matching file is returned
+    // immediately; otherwise the descendants of the requested directory are collected
+    // into a BTreeMap, which provides sorting alphabetically
     let mut archive = open_archive(&archive_path)?;
     let mut found_directory = relative_path.as_os_str().is_empty();
     let mut children = BTreeMap::<String, bool>::new();
 
     for entry in archive.entries()? {
-        let entry = entry?;
-        let entry_path = entry.path()?.into_owned();
+        let mut entry = entry?;
         let entry_type = entry.header().entry_type();
         if !entry_type.is_file() && !entry_type.is_dir() {
             continue;
         }
-
-        // If the entry is the requested directory, track that so we can indicate we found it
+        let entry_path = entry.path()?.into_owned();
         let is_directory = entry_type.is_dir();
+
+        // The requested path is a file: read its contents and return them directly
+        if !is_directory && entry_path == target_path {
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)?;
+            return Ok(Some(CrateArchiveEntry::File(contents)));
+        }
+
+        // If the entry is the requested directory itself, track that so we can
+        // indicate we found it
         if entry_path == target_path {
             found_directory |= is_directory;
             continue;
@@ -346,12 +335,62 @@ pub(crate) fn list_crate_directory(
             .or_insert(child_is_directory);
     }
 
-    Ok(found_directory.then(|| {
-        children
-            .into_iter()
-            .map(|(name, is_directory)| CrateDirectoryEntry { name, is_directory })
-            .collect()
-    }))
+    if !found_directory {
+        return Ok(None);
+    }
+    let entries: Vec<CrateDirectoryEntry> = children
+        .into_iter()
+        .map(|(name, is_directory)| CrateDirectoryEntry { name, is_directory })
+        .collect();
+    directory_cache_insert(&archive_path, &relative_path, entries.clone());
+    Ok(Some(CrateArchiveEntry::Directory(entries)))
+}
+
+/// The number of crate directory listings to keep cached. Listings are far cheaper
+/// to rebuild than rendered READMEs, but browsing generates many requests per archive.
+const DIRECTORY_CACHE_CAPACITY: usize = 500;
+
+type DirectoryCache = Mutex<LruCache<PathBuf, Vec<CrateDirectoryEntry>>>;
+
+/// The cache of previously listed crate directories. Only successful listings are
+/// cached, so archives downloaded by a later sync are listed on first request.
+static DIRECTORY_CACHE: OnceLock<DirectoryCache> = OnceLock::new();
+
+fn directory_cache_key(archive_path: &Path, relative_path: &Path) -> PathBuf {
+    // The relative path is normalized, so joining it onto the archive path is unambiguous.
+    archive_path.join(relative_path)
+}
+
+fn directory_cache_get(
+    archive_path: &Path,
+    relative_path: &Path,
+) -> Option<Vec<CrateDirectoryEntry>> {
+    let cache = directory_cache();
+    let mut cache = cache.lock().ok()?;
+    cache
+        .get(&directory_cache_key(archive_path, relative_path))
+        .cloned()
+}
+
+fn directory_cache_insert(
+    archive_path: &Path,
+    relative_path: &Path,
+    entries: Vec<CrateDirectoryEntry>,
+) {
+    let cache = directory_cache();
+    if let Ok(mut cache) = cache.lock() {
+        cache.put(directory_cache_key(archive_path, relative_path), entries);
+    }
+}
+
+/// Gets the cache. If it hasn't been initialized, initializes it first
+fn directory_cache() -> &'static DirectoryCache {
+    DIRECTORY_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(DIRECTORY_CACHE_CAPACITY)
+                .expect("directory cache capacity must be nonzero"),
+        ))
+    })
 }
 
 /// Checks that a path segment is safe. It checks it's not . or .., then ensures it's
@@ -415,12 +454,13 @@ fn determine_readme_location(manifest: &str) -> io::Result<ReadmeLocation> {
     // If not present, the default location is used
     let location = match package.get("readme") {
         Some(readme) if readme.as_bool() == Some(false) => ReadmeLocation::NotPresent,
-        Some(readme) if readme.as_str().is_some() => {
-            normalize_path_within_crate(Path::new(readme.as_str().unwrap()))
+        Some(readme) => match readme.as_str() {
+            Some(path) => normalize_path_within_crate(Path::new(path))
                 .map(ReadmeLocation::Explicit)
-                .unwrap_or(ReadmeLocation::NotPresent)
-        }
-        _ => ReadmeLocation::Default,
+                .unwrap_or(ReadmeLocation::NotPresent),
+            None => ReadmeLocation::Default,
+        },
+        None => ReadmeLocation::Default,
     };
     Ok(location)
 }
@@ -544,16 +584,20 @@ fn rewrite_crate_url(url: &str, crate_name: &str, version: &str, readme_path: &P
         return url.to_owned();
     }
 
+    let parsed_url = Url::parse(url);
+
     // Links to crates.io are resolved to other crates on the mirror
-    if let Ok(parsed_url) = Url::parse(url) {
-        if let Some(local_crate_url) = rewrite_crates_io_crate_url(&parsed_url) {
+    if let Ok(parsed_url) = &parsed_url {
+        if let Some(local_crate_url) = rewrite_crates_io_crate_url(parsed_url) {
             return local_crate_url;
         }
     }
+
+    // Relative URLs are resolved against the README's own location within the archive
     let mut base = Url::parse("https://panamax.invalid/").expect("static base URL is valid");
     base.set_path(&format!("/{}", readme_path.to_string_lossy()));
 
-    let destination = match Url::parse(url) {
+    let destination = match parsed_url {
         Ok(url) if is_loopback_url(&url) => {
             let path_and_suffix = format!(
                 "{}{}{}",
@@ -752,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_crate_files_and_rejects_paths_outside_the_archive() {
+    fn browses_crate_files_and_rejects_paths_outside_the_archive() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let mirror_path = temporary_directory.path();
         write_crate_archive(
@@ -762,48 +806,69 @@ mod tests {
             &[
                 ("Cargo.toml", "[package]\nname = \"foo\"\n"),
                 ("examples/demo.rs", "fn main() {}"),
+                ("src/lib.rs", "pub fn library() {}"),
             ],
         );
 
         assert_eq!(
-            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("examples/demo.rs"))
+            browse_crate_archive(mirror_path, "foo", "1.0.0", Path::new("examples/demo.rs"))
                 .unwrap()
                 .unwrap(),
-            b"fn main() {}"
+            CrateArchiveEntry::File(b"fn main() {}".to_vec())
         );
         assert_eq!(
-            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("missing")).unwrap(),
+            browse_crate_archive(mirror_path, "foo", "1.0.0", Path::new("missing")).unwrap(),
             None
         );
         assert_eq!(
-            read_crate_file(mirror_path, "foo", "1.0.0", Path::new("../Cargo.toml"))
+            browse_crate_archive(mirror_path, "foo", "1.0.0", Path::new("../Cargo.toml"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            list_crate_directory(mirror_path, "foo", "1.0.0", Path::new("examples"))
+            browse_crate_archive(mirror_path, "foo", "1.0.0", Path::new("examples"))
                 .unwrap()
                 .unwrap(),
-            vec![CrateDirectoryEntry {
+            CrateArchiveEntry::Directory(vec![CrateDirectoryEntry {
                 name: "demo.rs".to_owned(),
                 is_directory: false,
-            }]
+            }])
+        );
+        // The root path lists the archive root, in a single pass with any file request
+        assert_eq!(
+            browse_crate_archive(mirror_path, "foo", "1.0.0", Path::new(""))
+                .unwrap()
+                .unwrap(),
+            CrateArchiveEntry::Directory(vec![
+                CrateDirectoryEntry {
+                    name: "Cargo.toml".to_owned(),
+                    is_directory: false,
+                },
+                CrateDirectoryEntry {
+                    name: "examples".to_owned(),
+                    is_directory: true,
+                },
+                CrateDirectoryEntry {
+                    name: "src".to_owned(),
+                    is_directory: true,
+                },
+            ])
         );
     }
 
     #[test]
     fn readme_cache_keeps_the_100_most_recent_entries() {
-        let mut cache: LruCache<PathBuf, Option<Arc<str>>> =
+        let mut cache: LruCache<PathBuf, Arc<str>> =
             LruCache::new(NonZeroUsize::new(README_CACHE_CAPACITY).unwrap());
         for index in 0..README_CACHE_CAPACITY {
             cache.put(
                 PathBuf::from(format!("crate-{index}")),
-                Some(Arc::from(format!("rendered-{index}"))),
+                Arc::from(format!("rendered-{index}")),
             );
         }
         assert!(cache.get(Path::new("crate-0")).is_some());
-        cache.put(PathBuf::from("crate-100"), Some(Arc::from("rendered-100")));
+        cache.put(PathBuf::from("crate-100"), Arc::from("rendered-100"));
 
         assert!(cache.get(Path::new("crate-0")).is_some());
         assert!(cache.get(Path::new("crate-1")).is_none());
